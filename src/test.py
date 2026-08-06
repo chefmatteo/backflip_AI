@@ -2,11 +2,12 @@ import torch
 torch.set_num_threads(1)
 import torch.nn as nn
 import math, socket, struct
-from time import sleep
+from time import sleep, perf_counter
 
 # ---- config ----
 NUM_ENVS = 1     # how many envs to run
-DPHASE   = 0.0    # phase increment per step. 0 for a still frame; set 1/num_frames for a motion clip.
+DPHASE   = 1.0 / 111  # must match train.py's ref.dphase (1/num_frames). 0 freezes on one pose.
+STEP_DT  = 1.0 / 30.0  # must match mma.cpp's sim dt so playback runs at real time
 
 NUM_LINKS, NUM_JOINTS = 14, 13
 NUM_SKILLS, TARGET_DIM = 6, 3
@@ -25,6 +26,11 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             nn.Linear(512, action_dim))
         self.log_std = nn.Parameter(torch.full((action_dim,), math.log(0.05)))
+        # must mirror train.py's ActorCritic exactly or load_state_dict rejects the checkpoint
+        self.register_buffer("action_offset", torch.zeros(action_dim))
+        self.register_buffer("obs_mean",  torch.zeros(state_dim))
+        self.register_buffer("obs_var",   torch.ones(state_dim))
+        self.register_buffer("obs_count", torch.tensor(1e-4))
         self.critic_net = nn.Sequential(   # kept only so load_state_dict matches
             nn.Linear(state_dim, 1024),
             nn.Tanh(),
@@ -33,14 +39,10 @@ class ActorCritic(nn.Module):
             nn.Linear(512, 1))
 
     def act(self, s):
-        s_in = s.clone()
+        s_in = torch.clamp((s - self.obs_mean) / (self.obs_var.sqrt() + 1e-4), -5.0, 5.0)
         body = s_in[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
-        body[..., 1] -= s_in[:, 1:2]  # link y: absolute -> root-relative, before root itself is scaled
-        s_in[:, 1] *= 0.05
-        body[..., 0:3] *= 0.2
-        body[..., 7:13] *= 0.05
-        s_in = torch.clamp(s_in, -5.0, 5.0)
-        mean = self.actor_net(s_in)   # deterministic mean action = absolute PD target
+        body[..., 13] = 0.0  # grounded flag: isDone-only, not policy input (must match training)
+        mean = self.actor_net(s_in) + self.action_offset   # deterministic mean = absolute PD target
         return torch.clamp(mean, -math.pi, math.pi)
 
 model = ActorCritic()
@@ -51,7 +53,7 @@ model.eval()
 def isDone(state):
     body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
     grounded = body[:, :, 13]
-    return (grounded[:, 2:] > 0.5).any(dim=-1)
+    return (grounded[:, 2:] > 0.5).any(dim=-1) | (body[:, 6, 1] < 0.55)  # match train.py
 
 
 def pad_skill(raw):
@@ -85,6 +87,7 @@ udp = UDP("127.0.0.1", 5006, 5005)
 print("Running policy (no reference, no training)...")
 state = udp.get_state()
 phase = torch.zeros(NUM_ENVS)
+next_tick = perf_counter() + STEP_DT
 
 while True:
     state[:, 0] = phase
@@ -92,6 +95,13 @@ while True:
         target = model.act(state)          # absolute PD target straight from the net
     state = udp.step(target)
     phase = (phase + DPHASE) % 1.0
+
+    now = perf_counter()
+    if next_tick > now:
+        sleep(next_tick - now)
+        next_tick += STEP_DT
+    else:
+        next_tick = now + STEP_DT  # fell behind (e.g. reset stall); don't try to catch up
 
     done = isDone(state) | ~torch.isfinite(state).all(dim=1)
     if done.any():

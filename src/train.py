@@ -23,17 +23,31 @@ state_dim = RAW_STATE_DIM + NUM_SKILLS + TARGET_DIM  # what the policy/critic se
 action_dim = 3 * NUM_JOINTS
 
 ENT_COEF   = 0.0
-UNIT_M       = 0.05
 
 N = 100000
 T = 1024
-K_epochs = 4
+K_epochs = 5
 
 JOINTS = [(7,6),(8,7),(13,8),(9,8),(10,8),(11,9),(12,10),(4,6),(5,6),(2,4),(3,5),(0,2),(1,3)]
 CHILD  = torch.tensor([c for c, p in JOINTS])
 PARENT = torch.tensor([p for c, p in JOINTS])
 END_EFFECTORS = [0, 1, 11, 12]
 LINK_MASS = torch.tensor([1., 1, 2.5, 2.5, 4.5, 4.5, 5, 7, 8, 1.8, 1.8, 1.2, 1.2, 3])
+JOINT_W = torch.tensor([.5, .5, .3, .3, .3, .2, .2, .5, .5, .3, .3, .2, .2])
+CLIP      = 5.0
+
+# rest pose = the targetAngle each Joint is constructed with in mma.cpp Skeleton::init.
+# zero network output has to mean "stand", not "identity rotation on every joint".
+REST = torch.tensor([
+    # abs, chest, head, armR, armL, forearmR, forearmL,
+    # thighR, thighL, calfR, calfL, footR, footL
+    0,0,0,   0,0,0,   0,0,0,
+    0,0,-math.pi/2,  0,0,-math.pi/2,   # shoulders
+    0,0,0,  0,0,0,                     # elbows
+    0,0,-math.pi/2,  0,0,-math.pi/2,   # hips
+    0,0,0,  0,0,0,                     # knees
+    0,0, math.pi/2,  0,0, math.pi/2,   # ankles
+], dtype=torch.float32)
 
 ROOT = 6
 ROOT_ANCHORS = [
@@ -88,9 +102,20 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             nn.Linear(512, action_dim)
         )
-        
+        # start the policy AT the rest pose: tiny last layer + a constant offset,
+        # so an untrained net commands "stand" instead of "sit in mid-air"
+        nn.init.uniform_(self.actor_net[-1].weight, -0.01, 0.01)
+        nn.init.zeros_(self.actor_net[-1].bias)
+        self.register_buffer("action_offset", REST.clone())
+
         # fixed logstd following what deepmimic did
-        self.register_buffer("log_std", torch.full((action_dim,), math.log(0.05)))
+        self.register_buffer("log_std", torch.full((action_dim,), math.log(0.157)))
+
+        # running observation stats. buffers -> they ride along in state_dict()
+        # and survive a resume, instead of silently resetting to mean 0 / var 1
+        self.register_buffer("obs_mean",  torch.zeros(state_dim))
+        self.register_buffer("obs_var",   torch.ones(state_dim))
+        self.register_buffer("obs_count", torch.tensor(1e-4))
 
         # critic
         self.critic_net = nn.Sequential(
@@ -102,15 +127,14 @@ class ActorCritic(nn.Module):
         )
 
     def forward(self, s):
-        s_in = s.clone()
+        s_in = torch.clamp(
+            (s - self.obs_mean) / (self.obs_var.sqrt() + 1e-4),
+            -CLIP, CLIP
+        )
         body = s_in[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
-        body[..., 1] -= s_in[:, 1:2]  # link y: absolute -> root-relative, before root itself is scaled
-        s_in[:, 1] *= 0.05
-        body[..., 0:3] *= 0.2
-        body[..., 7:13] *= 0.05
-        s_in = torch.clamp(s_in, -5.0, 5.0)
+        body[..., 13] = 0.0
 
-        mean = self.actor_net(s_in)
+        mean = self.actor_net(s_in) + self.action_offset
         std = torch.exp(self.log_std)
         dist = Normal(mean, std)
 
@@ -118,8 +142,7 @@ class ActorCritic(nn.Module):
 
         return dist, value
 model = ActorCritic()
-opt = optim.Adam(model.parameters(), lr=3e-4)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N, eta_min=1e-5)
+opt = optim.Adam(model.parameters(), lr=1e-4)
 
 class RolloutBuffer:
     def __init__(self):
@@ -127,15 +150,17 @@ class RolloutBuffer:
         self.actions = []
         self.rewards = []
         self.dones = []
+        self.fells = []
         self.log_probs = []
         self.values = []
         self.advantages = []
         self.returns = []
-    def store(self, state, action, reward, done, log_prob, value):
+    def store(self, state, action, reward, done, fell, log_prob, value):
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
         self.dones.append(done.float())
+        self.fells.append(fell.float())
         self.log_probs.append(log_prob)
         self.values.append(value.squeeze(-1))
 
@@ -149,7 +174,7 @@ class RolloutBuffer:
         adv = []
         for t in reversed(range(len(self.rewards))):
             mask = 1.0 - self.dones[t]
-            delta = self.rewards[t] + gamma * values[t + 1] * mask - values[t]
+            delta = self.rewards[t] + gamma * values[t + 1] * (1.0 - self.fells[t]) - values[t]
             gae = delta + gamma * lam * mask * gae
             adv.insert(0, gae.clone())
 
@@ -167,7 +192,7 @@ class RolloutBuffer:
         # pose: per-joint + root rotation quaternion error
         q_sim = qmul(qconj(quat[:, PARENT]), quat[:, CHILD])
         dq = qmul(qconj(q_sim), ref.joint_q[i])
-        pose_err = (2.0 * torch.acos(dq[..., 0].abs().clamp(max=1.0))).pow(2).sum(-1)
+        pose_err = (JOINT_W * (2.0 * torch.acos(dq[..., 0].abs().clamp(max=1.0))).pow(2)).sum(-1)
 
         dq_root = qmul(qconj(quat[:, ROOT]), ref.root_q[i])
         root_rot_err = (2.0 * torch.acos(dq_root[..., 0].abs().clamp(max=1.0))).pow(2)
@@ -176,30 +201,32 @@ class RolloutBuffer:
 
         # velocity: per-joint angular velocity error
         ang_rel_sim = qrot(qconj(quat[:, PARENT]), ang[:, CHILD] - ang[:, PARENT])
-        vel_err = (ang_rel_sim - ref.joint_av[i]).pow(2).sum(-1).sum(-1)
+        vel_err = (JOINT_W * (ang_rel_sim - ref.joint_av[i]).pow(2).sum(-1)).sum(-1)
         r_vel = torch.exp(-(0.1 / 15.0 * NUM_JOINTS) * vel_err)
 
         # end-effector: hand/foot position error
-        de = (pos[:, END_EFFECTORS] - ref.link_p[i][:, END_EFFECTORS]) * UNIT_M
+        de = pos[:, END_EFFECTORS] - ref.link_p[i][:, END_EFFECTORS]
         r_end = torch.exp(-10.0 * de.pow(2).sum(-1).sum(-1))
 
         # root: position + rotation + linear/angular velocity error
-        root_pos_err = ((pos[:, ROOT] - ref.link_p[i][:, ROOT]) * UNIT_M).pow(2).sum(-1)
-        root_lin_vel_err = ((body[:, ROOT, 7:10] - ref.root_vel[i]) * UNIT_M).pow(2).sum(-1)
+        root_pos_err = (pos[:, ROOT] - ref.link_p[i][:, ROOT]).pow(2).sum(-1)
+        root_lin_vel_err = (body[:, ROOT, 7:10] - ref.root_vel[i]).pow(2).sum(-1)
         root_ang_vel_err = (ang[:, ROOT] - ref.root_ang_vel[i]).pow(2).sum(-1)
         root_err = root_pos_err + 0.1 * root_rot_err + 0.01 * root_lin_vel_err + 0.001 * root_ang_vel_err
         r_root = torch.exp(-5.0 * root_err)
 
         # center of mass: position error
         com = (pos * LINK_MASS.view(1, -1, 1)).sum(1) / LINK_MASS.sum()
-        dc = (com - ref.com[i]) * UNIT_M
+        dc = com - ref.com[i]
         r_com = torch.exp(-10.0 * dc.pow(2).sum(-1))
 
         return 0.5 * r_pose + 0.05 * r_vel + 0.15 * r_end + 0.2 * r_root + 0.1 * r_com
     def isDone(self, state):
         body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
         grounded = body[:, :, 13]
-        return (grounded[:, 2:] > 0.5).any(dim=-1)
+        non_foot_contact = (grounded[:, 2:] > 0.5).any(dim=-1)
+        pelvis_too_low   = body[:, 6, 1] < 0.55   # absolute height of pelvis
+        return non_foot_contact | pelvis_too_low
 
     def clear(self):
         self.__init__()
@@ -229,6 +256,14 @@ class Reference:
             self.root_vel     = torch.zeros(1, 3)
             self.root_ang_vel = torch.zeros(1, 3)
             print("No motion.npz -> using captured standing pose as 1-frame reference")
+
+        # the sim reports link xz relative to the pelvis (y stays absolute), so put the
+        # reference in the same frame. no-op while the clip stands at the origin,
+        # but without it every translating clip (backflip) penalises its own travel.
+        root_xz = self.link_p[:, ROOT:ROOT+1, :].clone()
+        root_xz[..., 1] = 0.0
+        self.link_p = self.link_p - root_xz
+        self.com    = (self.link_p * LINK_MASS.view(1, -1, 1)).sum(1) / LINK_MASS.sum()
 
         self.root_q = derive_root_quat(self.joint_q, self.link_p)
         self.F = self.joint_q.shape[0]
@@ -281,14 +316,14 @@ def updateModel(K_epochs):
     states        = torch.stack(buffer.states).view(-1, state_dim)
     actions       = torch.stack(buffer.actions).view(-1, action_dim)
     old_log_probs = torch.stack(buffer.log_probs).view(-1)
-    returns       = torch.stack(buffer.returns).view(-1).clamp(-300, 300)
+    returns       = torch.stack(buffer.returns).view(-1).clamp(0, 20)  # r in [0,1], gamma .95 -> max 20
     advantages    = torch.stack(buffer.advantages).view(-1)
 
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     advantages = advantages.clamp(-5, 5)
 
     N_samples = states.shape[0]
-    batch_size = N_samples // 4
+    batch_size = 1024
 
     for epoch in range(K_epochs):
         perm = torch.randperm(N_samples)
@@ -319,29 +354,36 @@ def updateModel(K_epochs):
         f"loss {loss.item():.2f} | "
         f"actor {actor_loss.item():.3f} | "
         f"critic {critic_loss.item():.3f} | "
-        f"std {torch.exp(model.log_std).mean().item():.3f}"
+        f"std {torch.exp(model.log_std).mean().item():.3f} | "
+        f"ep_len {steps_alive.mean().item():.1f}"   # the number that actually tracks learning
     )
 
 # ---------------------- load reference n' model ----------------------
 print("Starting training loop...")
 state_batch = udp.get_state()
-phase = torch.rand(NUM_ENVS)
 ref = Reference(state_batch)
+phase = torch.rand(NUM_ENVS)
 
 start_iteration = 0
 if os.path.exists("POLICY_3D.pt"):
     ckpt = torch.load("POLICY_3D.pt")
     model.load_state_dict(ckpt['model'])
     opt.load_state_dict(ckpt['optimizer'])
-    scheduler.load_state_dict(ckpt['scheduler'])
     start_iteration = ckpt['iteration'] + 1
     print(f"Resuming from iteration {start_iteration}")
 
 
+
 # ---------------------- train ----------------------
+EP_LIMIT_START = 150
+EP_LIMIT_END   = 300
+EP_ANNEAL_ITERS = 2000
+steps_alive = torch.zeros(NUM_ENVS)
+
 for iteration in range(start_iteration, N):
-    current_std = max(0.05, 0.05 - (0.00 * (iteration / 1500.0)))
+    current_std = max(0.157, 0.157 - (0.00 * (iteration / 1500.0)))
     model.log_std.data.fill_(math.log(current_std))
+    ep_limit = EP_LIMIT_START + (EP_LIMIT_END - EP_LIMIT_START) * min(iteration / EP_ANNEAL_ITERS, 1.0) ** 4
     buffer.clear()
 
     # data collection
@@ -349,6 +391,8 @@ for iteration in range(start_iteration, N):
         state_batch[:, 0] = phase
         with torch.no_grad():
             dist, value = model(state_batch)
+        # dist.mean already contains the rest-pose offset, so the sampled action IS the
+        # absolute PD target and log_prob matches exactly what gets stored
         action = torch.clamp(dist.sample(), -math.pi, math.pi)
         log_prob = dist.log_prob(action).sum(-1)
 
@@ -356,8 +400,11 @@ for iteration in range(start_iteration, N):
         target = ref.target(phase, action)
         next_state, reward, done = udp.step(target.view(NUM_ENVS, action_dim))
         bad = ~torch.isfinite(next_state).all(dim=1)
-        done = done | bad
-        buffer.store(state_batch, action, reward, done, log_prob, value)
+        steps_alive += 1
+        fell = done | bad
+        done = fell | (steps_alive >= (ep_limit))
+        reward = torch.where(fell, torch.zeros_like(reward), reward)
+        buffer.store(state_batch, action, reward, done, fell, log_prob, value)
 
         # reset envs
         state_batch = next_state
@@ -366,6 +413,7 @@ for iteration in range(start_iteration, N):
             for i in range(NUM_ENVS):
                 if done[i]:
                     phase[i] = float(torch.rand(1))
+                    steps_alive[i] = 0
                     udp.send_reset(i, phase[i])
             sleep(0.005)
             fresh = udp.get_state()
@@ -379,12 +427,35 @@ for iteration in range(start_iteration, N):
     # update model
     updateModel(K_epochs)
 
-    # update lr and save
-    scheduler.step()
+    # update running observation statistics AFTER the PPO epochs, so the whole rollout
+    # was collected and replayed under one consistent set of stats (ratio == 1 at step 0)
+    with torch.no_grad():
+        batch = torch.stack(buffer.states).view(-1, state_dim)
+        n = batch.shape[0]
+        d   = batch.mean(0) - model.obs_mean
+        tot = model.obs_count + n
+        model.obs_var.copy_((model.obs_var * model.obs_count + batch.var(0, unbiased=False) * n
+                             + d.pow(2) * model.obs_count * n / tot) / tot)
+        model.obs_mean.add_(d * n / tot)
+        model.obs_count.copy_(tot)
+
+    # save
     if (iteration % 10 == 0 and iteration > 0):
         torch.save({
             'iteration': iteration,
             'model':     model.state_dict(),
             'optimizer': opt.state_dict(),
-            'scheduler': scheduler.state_dict(),
         }, "POLICY_3D.pt")
+
+
+# test loop
+# while True:
+#     state_batch = udp.get_state()
+#     phase = state_batch[:, 0]  # editor drives phase from the timeline playhead now
+#     print("reward: ", buffer.getReward(state_batch), "  phase: ", phase)
+#     done = buffer.isDone(state_batch)
+#     for i in range(NUM_ENVS):
+#         if done[i]:
+#             print(f"env {i} done, resetting")
+#             udp.send_reset(i, phase[i])
+#     sleep(0.005)

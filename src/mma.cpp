@@ -17,6 +17,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <omp.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -25,11 +26,11 @@ using namespace std;
 
 // ================= camera ================= //
 struct Camera {
-    float radius = 50.0f;
+    float radius = 5.0f;
     float azimuth = 0.0f;
     float elevation = M_PI / 2.0f;
     float orbitSpeed = 0.01f;
-    double zoomSpeed = 10.0;
+    double zoomSpeed = 1.0;
     float panSpeed = 0.05f;
     bool dragging = false, panning = false;
     double lastX = 0.0, lastY = 0.0;
@@ -166,7 +167,7 @@ struct Grid {
     GLuint lineVAO, lineVBO;
     int lineVertexCount;
 
-    Grid(float size = 500.0f, int divisions = 50) {
+    Grid(float size = 20.0f, int divisions = 40) {
         float half = size / 2.0f;
         vector<float> vertices = {
             -half, 0, -half,   half, 0, -half,   half, 0, half,
@@ -195,7 +196,7 @@ struct Grid {
         glBindVertexArray(VAO);
         glDrawArrays(GL_TRIANGLES, 0, vertexCount);
 
-        glUniform4f(engine.colorLoc, 1.0f, 1.0f, 1.0f, 0.06f);
+        glUniform4f(engine.colorLoc, 1.0f, 1.0f, 1.0f, 0.15f);
         glBindVertexArray(lineVAO);
         glDrawArrays(GL_LINES, 0, lineVertexCount);
 
@@ -381,7 +382,7 @@ struct Joint {
         vec3 angVel = B->angVel - A->angVel;
 
         float k = stiffness * maxTorque;
-        float d = k / 10.0f;
+        float d = k / 50.0f;
 
         vec3 torque = k * error - d * angVel;
         if (length(torque) > maxTorque) torque = maxTorque * normalize(torque);
@@ -409,53 +410,53 @@ struct Skeleton {
 
         quat down = angleAxis(-float(M_PI) / 2.0f, vec3(0, 0, 1));
 
-        float ankleY = 1.2f, kneeY = 10.2f, hipY = 20.2f, hipZ = 2.0f;
-        float shoulderY = 31.2f, shoulderZ = 3.8f;
+        float ankleY = 0.0528f, kneeY = 0.4484f, hipY = 0.8880f, hipZ = 0.0879f;
+        float shoulderY = 1.3716f, shoulderZ = 0.1671f;
 
-        pelvis   = new Bone(vec3(pos.x, 21.8f, pos.z),            vec3(0.0f, 2.2f, 0.0f),  5.0f, 2);
-        abs      = new Bone(vec3(pos.x, 25.4f, pos.z),            vec3(0.0f, 1.75f, 0.0f), 7.0f, 2);
-        chest    = new Bone(vec3(pos.x, 29.6f, pos.z),            vec3(0.0f, 3.0f, 0.0f),  8.0f, 2);
-        head     = new Bone(vec3(pos.x, 34.6f, pos.z),            vec3(0.0f, 2.25f, 0.0f), 3.0f, 2);
+        pelvis   = new Bone(vec3(pos.x, 0.9584f, pos.z),            vec3(0.0f, 0.0967f, 0.0f), 5.0f, 2);
+        abs      = new Bone(vec3(pos.x, 1.1166f, pos.z),            vec3(0.0f, 0.0769f, 0.0f), 7.0f, 2);
+        chest    = new Bone(vec3(pos.x, 1.3013f, pos.z),            vec3(0.0f, 0.1319f, 0.0f), 8.0f, 2);
+        head     = new Bone(vec3(pos.x, 1.5211f, pos.z),            vec3(0.0f, 0.0989f, 0.0f), 3.0f, 2);
 
-        thighR   = new Bone(vec3(0, (hipY + kneeY) / 2, hipZ),    vec3(2.8f, 1.5f, 0.0f),  4.5f, 2);
-        thighL   = new Bone(vec3(0, (hipY + kneeY) / 2, -hipZ),   vec3(2.8f, 1.5f, 0.0f),  4.5f, 2);
-        calfR    = new Bone(vec3(0, (kneeY + ankleY) / 2, hipZ),  vec3(2.7f, 1.3f, 0.0f),  2.5f, 2);
-        calfL    = new Bone(vec3(0, (kneeY + ankleY) / 2, -hipZ), vec3(2.7f, 1.3f, 0.0f),  2.5f, 2);
-        footR    = new Bone(vec3(1.5f, 0.6f, hipZ),               vec3(2.7f, 0.6f, 1.0f),  1.0f, 1);
-        footL    = new Bone(vec3(1.5f, 0.6f, -hipZ),              vec3(2.7f, 0.6f, 1.0f),  1.0f, 1);
+        thighR   = new Bone(vec3(0, (hipY + kneeY) / 2, hipZ),    vec3(0.1231f, 0.0659f, 0.0f), 4.5f, 2);
+        thighL   = new Bone(vec3(0, (hipY + kneeY) / 2, -hipZ),   vec3(0.1231f, 0.0659f, 0.0f), 4.5f, 2);
+        calfR    = new Bone(vec3(0, (kneeY + ankleY) / 2, hipZ),  vec3(0.1187f, 0.0572f, 0.0f), 2.5f, 2);
+        calfL    = new Bone(vec3(0, (kneeY + ankleY) / 2, -hipZ), vec3(0.1187f, 0.0572f, 0.0f), 2.5f, 2);
+        footR    = new Bone(vec3(0.0659f, 0.0264f, hipZ),         vec3(0.1187f, 0.0264f, 0.0440f), 1.0f, 1);
+        footL    = new Bone(vec3(0.0659f, 0.0264f, -hipZ),        vec3(0.1187f, 0.0264f, 0.0440f), 1.0f, 1);
 
-        armR     = new Bone(vec3(0, shoulderY - 3.0f, shoulderZ), vec3(1.9f, 1.1f, 0.0f),  1.8f, 2);
-        armL     = new Bone(vec3(0, shoulderY - 3.0f, -shoulderZ),vec3(1.9f, 1.1f, 0.0f),  1.8f, 2);
-        forearmR = new Bone(vec3(0, shoulderY - 8.5f, shoulderZ), vec3(1.5f, 1.0f, 0.0f),  1.2f, 2);
-        forearmL = new Bone(vec3(0, shoulderY - 8.5f, -shoulderZ),vec3(1.5f, 1.0f, 0.0f),  1.2f, 2);
+        armR     = new Bone(vec3(0, shoulderY - 0.1319f, shoulderZ), vec3(0.0835f, 0.0484f, 0.0f), 1.8f, 2);
+        armL     = new Bone(vec3(0, shoulderY - 0.1319f, -shoulderZ),vec3(0.0835f, 0.0484f, 0.0f), 1.8f, 2);
+        forearmR = new Bone(vec3(0, shoulderY - 0.3737f, shoulderZ), vec3(0.0659f, 0.0440f, 0.0f), 1.2f, 2);
+        forearmL = new Bone(vec3(0, shoulderY - 0.3737f, -shoulderZ),vec3(0.0659f, 0.0440f, 0.0f), 1.2f, 2);
 
         for (Bone* b : {thighR, thighL, calfR, calfL, armR, armL, forearmR, forearmL}) b->orient = down;
 
         bones = { footR, footL, calfR, calfL, thighR, thighL, pelvis, abs, chest, armR, armL, forearmR, forearmL, head };
 
         delete ball; delete clavR; delete clavL;
-        ball  = new Bone(vec3(0), vec3(0.0f, 0.85f, 0.0f), 1.0f, 2, vec3(0.20f, 0.20f, 0.28f));
-        clavR = new Bone(vec3(0), vec3(1.2f, 1.0f, 0.0f), 1.0f, 2);
-        clavL = new Bone(vec3(0), vec3(1.2f, 1.0f, 0.0f), 1.0f, 2);
+        ball  = new Bone(vec3(0), vec3(0.0f, 0.0374f, 0.0f), 1.0f, 2, vec3(0.20f, 0.20f, 0.28f));
+        clavR = new Bone(vec3(0), vec3(0.0528f, 0.0440f, 0.0f), 1.0f, 2);
+        clavL = new Bone(vec3(0), vec3(0.0528f, 0.0440f, 0.0f), 1.0f, 2);
 
-        float gap = 0.3f;
+        float gap = 0.0132f;
         auto top = [=](Bone* b) { return vec3(-b->dims.x - b->dims.y - gap, 0, 0); };
         auto bot = [=](Bone* b) { return vec3( b->dims.x + b->dims.y + gap, 0, 0); };
         float hp = float(M_PI) / 2.0f;
 
-        joints.push_back(Joint(pelvis, abs,      vec3(0,  1.8f, 0),          vec3(0, -1.8f, 0),     vec3(0, 0, 0),   2.0f, 6000.0f));
-        joints.push_back(Joint(abs,    chest,    vec3(0,  1.8f, 0),          vec3(0, -2.4f, 0),     vec3(0, 0, 0),   2.0f, 6000.0f));
-        joints.push_back(Joint(chest,  head,     vec3(0,  2.9f, 0),          vec3(0, -2.1f, 0),     vec3(0, 0, 0),   2.0f, 1000.0f));
-        joints.push_back(Joint(chest,  armR,     vec3(0,  1.6f,  shoulderZ), top(armR),             vec3(0, 0, -hp), 2.0f, 4000.0f));
-        joints.push_back(Joint(chest,  armL,     vec3(0,  1.6f, -shoulderZ), top(armL),             vec3(0, 0, -hp), 2.0f, 4000.0f));
-        joints.push_back(Joint(armR,   forearmR, bot(armR),                  top(forearmR),         vec3(0, 0, 0),   2.0f, 3000.0f));
-        joints.push_back(Joint(armL,   forearmL, bot(armL),                  top(forearmL),         vec3(0, 0, 0),   2.0f, 3000.0f));
-        joints.push_back(Joint(pelvis, thighR,   vec3(0, -1.6f,  hipZ-0.5f), top(thighR),           vec3(0, 0, -hp), 4.0f, 6000.0f));
-        joints.push_back(Joint(pelvis, thighL,   vec3(0, -1.6f, -hipZ+0.5f), top(thighL),           vec3(0, 0, -hp), 4.0f, 6000.0f));
-        joints.push_back(Joint(thighR, calfR,    bot(thighR),                top(calfR),            vec3(0, 0, 0),   4.0f, 6000.0f));
-        joints.push_back(Joint(thighL, calfL,    bot(thighL),                top(calfL),            vec3(0, 0, 0),   4.0f, 6000.0f));
-        joints.push_back(Joint(calfR,  footR,    bot(calfR),                 vec3(-0.7f, 0.25f, 0), vec3(0, 0, hp),  5.0f, 4000.0f));
-        joints.push_back(Joint(calfL,  footL,    bot(calfL),                 vec3(-0.7f, 0.25f, 0), vec3(0, 0, hp),  5.0f, 4000.0f));
+        joints.push_back(Joint(pelvis, abs,      vec3(0,  0.0791f, 0),          vec3(0, -0.0791f, 0),      vec3(0, 0, 0),   2.0f, 150.0f));
+        joints.push_back(Joint(abs,    chest,    vec3(0,  0.0791f, 0),          vec3(0, -0.1055f, 0),      vec3(0, 0, 0),   2.0f, 200.0f));
+        joints.push_back(Joint(chest,  head,     vec3(0,  0.1275f, 0),          vec3(0, -0.0923f, 0),      vec3(0, 0, 0),   2.0f, 50.0f));
+        joints.push_back(Joint(chest,  armR,     vec3(0,  0.0703f,  shoulderZ), top(armR),                 vec3(0, 0, -hp), 2.0f, 100.0f));
+        joints.push_back(Joint(chest,  armL,     vec3(0,  0.0703f, -shoulderZ), top(armL),                 vec3(0, 0, -hp), 2.0f, 100.0f));
+        joints.push_back(Joint(armR,   forearmR, bot(armR),                     top(forearmR),             vec3(0, 0, 0),   2.0f, 60.0f));
+        joints.push_back(Joint(armL,   forearmL, bot(armL),                     top(forearmL),             vec3(0, 0, 0),   2.0f, 60.0f));
+        joints.push_back(Joint(pelvis, thighR,   vec3(0, -0.0703f,  hipZ-0.0220f), top(thighR),             vec3(0, 0, -hp), 4.0f, 200.0f));
+        joints.push_back(Joint(pelvis, thighL,   vec3(0, -0.0703f, -hipZ+0.0220f), top(thighL),             vec3(0, 0, -hp), 4.0f, 200.0f));
+        joints.push_back(Joint(thighR, calfR,    bot(thighR),                   top(calfR),                vec3(0, 0, 0),   4.0f, 150.0f));
+        joints.push_back(Joint(thighL, calfL,    bot(thighL),                   top(calfL),                vec3(0, 0, 0),   4.0f, 150.0f));
+        joints.push_back(Joint(calfR,  footR,    bot(calfR),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 90.0f));
+        joints.push_back(Joint(calfL,  footL,    bot(calfL),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 90.0f));
 
         for (Joint& j : joints) {
             vec3 err = (j.A->pos + j.A->orient * j.anchorA) - (j.B->pos + j.B->orient * j.anchorB);
@@ -463,9 +464,6 @@ struct Skeleton {
         }
     }
 
-    // frame < 0 -> random frame. phase01 in [0,1] -> the exact frame train.py's
-    // Reference.idx() would pick for that phase, so python and the sim always agree
-    // on which point in the motion the character was actually placed at after a reset.
     void getPos(int frame = -1, float phase01 = -1.0f) {
         static vector<vector<float>> frames;
         if (frames.empty()) {
@@ -530,9 +528,9 @@ struct Skeleton {
             ball->draw();
         }
         float hp = float(M_PI) / 2.0f;
-        clavR->pos = chest->pos + chest->orient * vec3(0, 1.6f, 2.1f);
+        clavR->pos = chest->pos + chest->orient * vec3(0, 0.0703f, 0.0923f);
         clavR->orient = chest->orient * angleAxis(-hp, vec3(0, 1, 0));
-        clavL->pos = chest->pos + chest->orient * vec3(0, 1.6f, -2.1f);
+        clavL->pos = chest->pos + chest->orient * vec3(0, 0.0703f, -0.0923f);
         clavL->orient = chest->orient * angleAxis(hp, vec3(0, 1, 0));
         clavR->draw();
         clavL->draw();
@@ -626,32 +624,32 @@ struct Skeleton {
 vector<Skeleton*> envs {
     new Skeleton(vec3(0, 0, 0), 0),
 
-    // new Skeleton(vec3(50, 0, 0), 1),
-    // new Skeleton(vec3(-50, 0, 0), 2),
-    // new Skeleton(vec3(0, 0, 50), 3),
-    // new Skeleton(vec3(0, 0, -50), 4),
-    // new Skeleton(vec3(50, 0, -50), 5),
-    // new Skeleton(vec3(-50, 0, 50), 6),
-    // new Skeleton(vec3(50, 0, 50), 7),
-    // new Skeleton(vec3(-50, 0, -50), 8),
+    // new Skeleton(vec3(3, 0, 0), 1),
+    // new Skeleton(vec3(-3, 0, 0), 2),
+    // new Skeleton(vec3(0, 0, 3), 3),
+    // new Skeleton(vec3(0, 0, -3), 4),
+    // new Skeleton(vec3(3, 0, -3), 5),
+    // new Skeleton(vec3(-3, 0, 3), 6),
+    // new Skeleton(vec3(3, 0, 3), 7),
+    // new Skeleton(vec3(-3, 0, -3), 8),
 
-    // new Skeleton(vec3(100, 0, 0), 9),
-    // new Skeleton(vec3(-100, 0, 0), 10),
-    // new Skeleton(vec3(0, 0, 100), 11),
-    // new Skeleton(vec3(0, 0, -100), 12),
-    // new Skeleton(vec3(100, 0, -100), 13),
-    // new Skeleton(vec3(-100, 0, 100), 14),
-    // new Skeleton(vec3(100, 0, 100), 15),
-    // new Skeleton(vec3(-100, 0, -100), 16),
+    // new Skeleton(vec3(6, 0, 0), 9),
+    // new Skeleton(vec3(-6, 0, 0), 10),
+    // new Skeleton(vec3(0, 0, 6), 11),
+    // new Skeleton(vec3(0, 0, -6), 12),
+    // new Skeleton(vec3(6, 0, -6), 13),
+    // new Skeleton(vec3(-6, 0, 6), 14),
+    // new Skeleton(vec3(6, 0, 6), 15),
+    // new Skeleton(vec3(-6, 0, -6), 16),
 
-    // new Skeleton(vec3(100, 0, 50), 17),
-    // new Skeleton(vec3(100, 0, -50), 18),
-    // new Skeleton(vec3(50, 0, 100), 19),
-    // new Skeleton(vec3(-50, 0, 100), 20),
-    // new Skeleton(vec3(50, 0, -100), 21),
-    // new Skeleton(vec3(-50, 0, -100), 22),
-    // new Skeleton(vec3(-100, 0, 50), 23),
-    // new Skeleton(vec3(-100, 0, -50), 24),
+    // new Skeleton(vec3(6, 0, 3), 17),
+    // new Skeleton(vec3(6, 0, -3), 18),
+    // new Skeleton(vec3(3, 0, 6), 19),
+    // new Skeleton(vec3(-3, 0, 6), 20),
+    // new Skeleton(vec3(3, 0, -6), 21),
+    // new Skeleton(vec3(-3, 0, -6), 22),
+    // new Skeleton(vec3(-6, 0, 3), 23),
+    // new Skeleton(vec3(-6, 0, -3), 24),
 
 };
 
@@ -703,8 +701,9 @@ struct Data {
                     i += 3;
                 }
             float dt = 1.0f / 30.0f;
-            for (Skeleton* env : envs)
-                for (int s = 0; s < 8; s++) env->step(dt / 8.0f);
+            #pragma omp parallel for
+            for (int e = 0; e < (int)envs.size(); e++)
+                for (int s = 0; s < 40; s++) envs[e]->step(dt / 40.0f);
             return true;
         }
         return false;
@@ -769,10 +768,10 @@ int main() {
         if (udp.receiveData()) udp.sendData();
 
         engine.beginFrame();
-        grid.draw();
-        for (Skeleton* skeleton : envs) {skeleton->draw();}
 
         if (++timer % frameDivider == 0){
+            grid.draw();
+            for (Skeleton* skeleton : envs) {skeleton->draw();}
             glfwSwapBuffers(engine.window);
             timer = 0;
         }

@@ -333,6 +333,8 @@ if os.path.exists("POLICY_3D.pt"):
     print(f"Resuming from iteration {start_iteration}")
 
 
+
+
 # ---------------------- train ----------------------
 for iteration in range(start_iteration, N):
     current_std = max(0.05, 0.15 - (0.10 * (iteration / 1500.0)))
