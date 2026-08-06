@@ -343,9 +343,16 @@ struct Joint {
     float maxTorque = 200.0f;
     vec3 targetAngle = vec3(0);
     float stiffness = 1.0f;
+    float damping;
 
     Joint(Bone* a, Bone* b, vec3 anchorA, vec3 anchorB, vec3 targetAngle, float stiffness = 1.0f, float maxTorque = 200.0f)
-        : A(a), B(b), anchorA(anchorA), anchorB(anchorB), maxTorque(maxTorque), targetAngle(targetAngle), stiffness(stiffness) {}
+        : A(a), B(b), anchorA(anchorA), anchorB(anchorB), maxTorque(maxTorque), targetAngle(targetAngle), stiffness(stiffness) {
+        // damp relative to THIS joint's inertia (child body about the anchor), not one global
+        // ratio. k/50 gave zeta ~0.7 everywhere except the ankle, where the foot is so light
+        // it came out at 2.7 - damping alone ate 77% of the ankle's torque during a jump.
+        float I = 1.0f / b->invInertiaBody[2][2] + b->mass * dot(anchorB, anchorB);
+        damping = 1.4f * sqrt(stiffness * maxTorque * I);   // 1.4 = 2*zeta, zeta = 0.7
+    }
 
     void solve(float dt) {
         mat3 RA = mat3_cast(A->orient), RB = mat3_cast(B->orient);
@@ -382,9 +389,8 @@ struct Joint {
         vec3 angVel = B->angVel - A->angVel;
 
         float k = stiffness * maxTorque;
-        float d = k / 50.0f;
 
-        vec3 torque = k * error - d * angVel;
+        vec3 torque = k * error - damping * angVel;
         if (length(torque) > maxTorque) torque = maxTorque * normalize(torque);
 
         vec3 impulse = torque * dt;
@@ -455,8 +461,10 @@ struct Skeleton {
         joints.push_back(Joint(pelvis, thighL,   vec3(0, -0.0703f, -hipZ+0.0220f), top(thighL),             vec3(0, 0, -hp), 4.0f, 200.0f));
         joints.push_back(Joint(thighR, calfR,    bot(thighR),                   top(calfR),                vec3(0, 0, 0),   4.0f, 150.0f));
         joints.push_back(Joint(thighL, calfL,    bot(thighL),                   top(calfL),                vec3(0, 0, 0),   4.0f, 150.0f));
-        joints.push_back(Joint(calfR,  footR,    bot(calfR),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 90.0f));
-        joints.push_back(Joint(calfL,  footL,    bot(calfL),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 90.0f));
+        // ankle 90 -> 150: toe-off needs ~106 Nm to pass 3.2x bodyweight through the foot's
+        // 0.15 m lever. 150 Nm at 45 kg is in the human plantarflexion range for a jump.
+        joints.push_back(Joint(calfR,  footR,    bot(calfR),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 150.0f));
+        joints.push_back(Joint(calfL,  footL,    bot(calfL),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 150.0f));
 
         for (Joint& j : joints) {
             vec3 err = (j.A->pos + j.A->orient * j.anchorA) - (j.B->pos + j.B->orient * j.anchorB);
@@ -491,8 +499,13 @@ struct Skeleton {
         for (int j = 0; j < 13; j++)
             jointQuat[j] = quat(row[j*4], row[j*4+1], row[j*4+2], row[j*4+3]);
 
-        for (int i = 0; i < (int)bones.size(); i++)
+        for (int i = 0; i < (int)bones.size(); i++) {
             bones[i]->pos = vec3(pos.x + row[52 + i*3], row[52 + i*3 + 1], pos.z + row[52 + i*3 + 2]);
+            // grounded is only written by floorCollision, which runs inside step(). a reset
+            // teleports without stepping, so without this the contact flags from the fall
+            // survive into the next state and python reads the fresh pose as "already down".
+            bones[i]->grounded = false;
+        }
 
         // pelvis world orientation, columns 137-140 (absent in old bakes -> identity)
         pelvis->orient = row.size() >= 141 ? quat(row[137], row[138], row[139], row[140]) : quat(1, 0, 0, 0);
@@ -578,14 +591,18 @@ struct Skeleton {
         mat3 invI = R * b->invInertiaBody * transpose(R);
         vec3 n(0, 1, 0);
 
-        float maxPen = 0.0f;
+        float maxPen = 0.0f;      // clamped at 0, drives the positional correction below
+        float nearest = -1e9f;    // true signed distance, drives the grounded flag
         vector<float> jnAcc(pts.size(), 0.0f), jtAcc(pts.size(), 0.0f);
         for (int iter = 0; iter < 8; iter++) {
             for (size_t i = 0; i < pts.size(); i++) {
                 vec3 contact = b->pos + R * pts[i];
                 float penetration = r - contact.y;
                 if (penetration <= -margin) continue;
-                if (iter == 0) maxPen = glm::max(maxPen, penetration);
+                if (iter == 0) {
+                    maxPen  = glm::max(maxPen, penetration);
+                    nearest = glm::max(nearest, penetration);
+                }
 
                 vec3 rw = contact - b->pos;
                 vec3 vel = b->vel + cross(b->angVel, rw);
@@ -594,7 +611,11 @@ struct Skeleton {
                 float denom = b->invMass + dot(cross(invI * cross(rw, n), rw), n);
                 if (denom == 0) continue;
 
-                float jn = -(1.0f + restitution) * vn / denom;
+                // speculative contact: while still separated by `gap`, the bone is allowed to
+                // approach at gap/dt so it lands ON the surface. killing all normal velocity
+                // the moment it entered the 5 cm margin left it hovering there permanently.
+                float vTarget = glm::min(penetration, 0.0f) / dt;
+                float jn = -(1.0f + restitution) * (vn - vTarget) / denom;
                 float jnNew = glm::max(jnAcc[i] + jn, 0.0f);
                 jn = jnNew - jnAcc[i];
                 jnAcc[i] = jnNew;
@@ -618,38 +639,40 @@ struct Skeleton {
             }
         }
         b->pos += n * (percent * glm::max(maxPen - slop, 0.0f));
-        b->grounded = maxPen > 0.0f;
+        // "in contact", not "overlapping". requiring strict penetration made this fire only on
+        // violent impacts and never on a settled body, so isDone never terminated a fall.
+        b->grounded = nearest > -0.02f;
     }
 };
 vector<Skeleton*> envs {
     new Skeleton(vec3(0, 0, 0), 0),
 
-    // new Skeleton(vec3(3, 0, 0), 1),
-    // new Skeleton(vec3(-3, 0, 0), 2),
-    // new Skeleton(vec3(0, 0, 3), 3),
-    // new Skeleton(vec3(0, 0, -3), 4),
-    // new Skeleton(vec3(3, 0, -3), 5),
-    // new Skeleton(vec3(-3, 0, 3), 6),
-    // new Skeleton(vec3(3, 0, 3), 7),
-    // new Skeleton(vec3(-3, 0, -3), 8),
+    new Skeleton(vec3(3, 0, 0), 1),
+    new Skeleton(vec3(-3, 0, 0), 2),
+    new Skeleton(vec3(0, 0, 3), 3),
+    new Skeleton(vec3(0, 0, -3), 4),
+    new Skeleton(vec3(3, 0, -3), 5),
+    new Skeleton(vec3(-3, 0, 3), 6),
+    new Skeleton(vec3(3, 0, 3), 7),
+    new Skeleton(vec3(-3, 0, -3), 8),
 
-    // new Skeleton(vec3(6, 0, 0), 9),
-    // new Skeleton(vec3(-6, 0, 0), 10),
-    // new Skeleton(vec3(0, 0, 6), 11),
-    // new Skeleton(vec3(0, 0, -6), 12),
-    // new Skeleton(vec3(6, 0, -6), 13),
-    // new Skeleton(vec3(-6, 0, 6), 14),
-    // new Skeleton(vec3(6, 0, 6), 15),
-    // new Skeleton(vec3(-6, 0, -6), 16),
+    new Skeleton(vec3(6, 0, 0), 9),
+    new Skeleton(vec3(-6, 0, 0), 10),
+    new Skeleton(vec3(0, 0, 6), 11),
+    new Skeleton(vec3(0, 0, -6), 12),
+    new Skeleton(vec3(6, 0, -6), 13),
+    new Skeleton(vec3(-6, 0, 6), 14),
+    new Skeleton(vec3(6, 0, 6), 15),
+    new Skeleton(vec3(-6, 0, -6), 16),
 
-    // new Skeleton(vec3(6, 0, 3), 17),
-    // new Skeleton(vec3(6, 0, -3), 18),
-    // new Skeleton(vec3(3, 0, 6), 19),
-    // new Skeleton(vec3(-3, 0, 6), 20),
-    // new Skeleton(vec3(3, 0, -6), 21),
-    // new Skeleton(vec3(-3, 0, -6), 22),
-    // new Skeleton(vec3(-6, 0, 3), 23),
-    // new Skeleton(vec3(-6, 0, -3), 24),
+    new Skeleton(vec3(6, 0, 3), 17),
+    new Skeleton(vec3(6, 0, -3), 18),
+    new Skeleton(vec3(3, 0, 6), 19),
+    new Skeleton(vec3(-3, 0, 6), 20),
+    new Skeleton(vec3(3, 0, -6), 21),
+    new Skeleton(vec3(-3, 0, -6), 22),
+    new Skeleton(vec3(-6, 0, 3), 23),
+    new Skeleton(vec3(-6, 0, -3), 24),
 
 };
 
@@ -675,16 +698,17 @@ struct Data {
         bind(sock, (sockaddr*)&server, sizeof(server));
     }
 
-    bool receiveData() {
+    // 0 = nothing queued | 1 = reply with state | 2 = handled, no reply
+    int receiveData() {
         vector<float> recvBuffer(envs.size() * ACTION_DIM);
         int bytesRead = recv(sock, (char*)recvBuffer.data(), recvBuffer.size() * sizeof(float), MSG_DONTWAIT);
         if (bytesRead < (int)(2 * sizeof(float))) {
             std::this_thread::sleep_for(std::chrono::microseconds(200)); // don't busy-spin a full core while idle
-            return false;
+            return 0;
         }
 
         if (recvBuffer[0] == -100.0f) {
-            return true; // asking for state, no step
+            return 1; // asking for state, no step
         } else if (recvBuffer[0] == -69.0f) {
             int idx = (int)recvBuffer[1];
             float phase = recvBuffer[2]; // train.py's send_reset(env_idx, phase)
@@ -692,7 +716,7 @@ struct Data {
                 Skeleton* env = envs[idx];
                 env->getPos(-1, phase); // same frame train.py's Reference.idx(phase) picks
             }
-            return false;
+            return 2;
         } else if (bytesRead == (int)(envs.size() * ACTION_DIM * sizeof(float))) {
             int i = 0;
             for (Skeleton* env : envs)
@@ -704,9 +728,9 @@ struct Data {
             #pragma omp parallel for
             for (int e = 0; e < (int)envs.size(); e++)
                 for (int s = 0; s < 40; s++) envs[e]->step(dt / 40.0f);
-            return true;
+            return 1;
         }
-        return false;
+        return 2;
     }
     void sendData() {
         vector<float> stateBuffer(envs.size() * STATE_DIM);
@@ -765,7 +789,13 @@ int main() {
     while (!glfwWindowShouldClose(engine.window)) {
         KeyControl(engine.window);
 
-        if (udp.receiveData()) udp.sendData();
+        // drain everything queued this frame. one datagram per rendered frame meant a batch
+        // of 25 resets took 25 frames to apply, so envs visibly sat on the floor meanwhile.
+        for (int n = 0; n < 64; n++) {
+            int r = udp.receiveData();
+            if (r == 0) break;
+            if (r == 1) { udp.sendData(); break; }
+        }
 
         engine.beginFrame();
 

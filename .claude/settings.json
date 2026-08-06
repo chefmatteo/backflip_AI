@@ -190,7 +190,12 @@
       "Bash(grep -oE \"[0-9.]+f\\\\\\)\\\\\\); //.*|[0-9.]+f\\\\\\)\\\\\\)$\")",
       "Bash(curl -sL \"https://api.github.com/repos/xbpeng/DeepMimic/git/trees/master?recursive=1\")",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(t['path']\\) for t in d.get\\('tree',[]\\) if 'ctrl' in t['path'].lower\\(\\) or \\('humanoid3d' in t['path'].lower\\(\\) and t['path'].endswith\\('.txt'\\)\\)]\")",
-      "Bash(python -c \"import ast;ast.parse\\(open\\('src/test.py'\\).read\\(\\)\\);print\\('ok'\\)\")"
+      "Bash(python -c \"import ast;ast.parse\\(open\\('src/test.py'\\).read\\(\\)\\);print\\('ok'\\)\")",
+      "Bash(g++ -fsyntax-only -fopenmp -Isrc src/mma.cpp)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(python -c \"import ast;ast.parse\\(open\\('src/train.py'\\).read\\(\\)\\);print\\('ok'\\)\")",
+      "Bash(g++ src/mma.cpp -g -O2 -o mma -fopenmp -lglfw -lGLEW -lGL -ldl -lpthread)",
+      "Bash(python -c \"import ast;ast.parse\\(open\\('src/train.py'\\).read\\(\\)\\);print\\('train.py ok'\\)\")"
     ],
     "additionalDirectories": [
       "/home/kavang/.config/hypr",

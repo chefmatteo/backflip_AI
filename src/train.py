@@ -142,7 +142,12 @@ class ActorCritic(nn.Module):
 
         return dist, value
 model = ActorCritic()
-opt = optim.Adam(model.parameters(), lr=1e-4)
+# deepmimic trains the value function far faster than the policy (their appendix D: value 1e-2
+# vs policy 5e-5). a slow critic gives bad advantages, and PPO then only hears the loudest signal.
+opt = optim.Adam([
+    {'params': model.actor_net.parameters(),  'lr': 1e-4},
+    {'params': model.critic_net.parameters(), 'lr': 1e-3},
+])
 
 class RolloutBuffer:
     def __init__(self):
@@ -224,9 +229,7 @@ class RolloutBuffer:
     def isDone(self, state):
         body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
         grounded = body[:, :, 13]
-        non_foot_contact = (grounded[:, 2:] > 0.5).any(dim=-1)
-        pelvis_too_low   = body[:, 6, 1] < 0.55   # absolute height of pelvis
-        return non_foot_contact | pelvis_too_low
+        return (grounded[:, 2:] > 0.5).any(dim=-1)   # non-foot contact only, same as deepmimic
 
     def clear(self):
         self.__init__()
@@ -364,13 +367,22 @@ state_batch = udp.get_state()
 ref = Reference(state_batch)
 phase = torch.rand(NUM_ENVS)
 
+NEW_SKILL = True   # warm-starting onto a different clip. set False for a plain resume.
+
 start_iteration = 0
 if os.path.exists("POLICY_3D.pt"):
     ckpt = torch.load("POLICY_3D.pt")
     model.load_state_dict(ckpt['model'])
-    opt.load_state_dict(ckpt['optimizer'])
-    start_iteration = ckpt['iteration'] + 1
-    print(f"Resuming from iteration {start_iteration}")
+    if NEW_SKILL:
+        # keep the weights (balance, contact, PD holding all transfer), throw away everything
+        # fitted to the old clip: obs stats are pinned to standing-scale velocities, and Adam's
+        # moments are tuned to a reward landscape that no longer exists
+        model.obs_count.fill_(1e-4)
+        print("Warm start: weights kept, obs stats + optimizer reset")
+    else:
+        opt.load_state_dict(ckpt['optimizer'])
+        start_iteration = ckpt['iteration'] + 1
+        print(f"Resuming from iteration {start_iteration}")
 
 
 
@@ -381,7 +393,10 @@ EP_ANNEAL_ITERS = 2000
 steps_alive = torch.zeros(NUM_ENVS)
 
 for iteration in range(start_iteration, N):
-    current_std = max(0.157, 0.157 - (0.00 * (iteration / 1500.0)))
+    # anneal exploration: 0.157 rad (~9 deg) of jitter on every joint is what finds the skill
+    # early, but it's what stops it landing precisely once the skill is roughly there.
+    _t = min(max(iteration - 1200, 0) / 2500.0, 1.0)
+    current_std = 0.157 - _t * (0.157 - 0.07)
     model.log_std.data.fill_(math.log(current_std))
     ep_limit = EP_LIMIT_START + (EP_LIMIT_END - EP_LIMIT_START) * min(iteration / EP_ANNEAL_ITERS, 1.0) ** 4
     buffer.clear()

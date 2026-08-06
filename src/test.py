@@ -6,7 +6,7 @@ from time import sleep, perf_counter
 
 # ---- config ----
 NUM_ENVS = 1     # how many envs to run
-DPHASE   = 1.0 / 111  # must match train.py's ref.dphase (1/num_frames). 0 freezes on one pose.
+DPHASE   = 1.0 / 79  # must match train.py's ref.dphase (1/num_frames). 0 freezes on one pose.
 STEP_DT  = 1.0 / 30.0  # must match mma.cpp's sim dt so playback runs at real time
 
 NUM_LINKS, NUM_JOINTS = 14, 13
@@ -53,7 +53,7 @@ model.eval()
 def isDone(state):
     body = state[:, 2:RAW_STATE_DIM].view(-1, NUM_LINKS, 14)
     grounded = body[:, :, 13]
-    return (grounded[:, 2:] > 0.5).any(dim=-1) | (body[:, 6, 1] < 0.55)  # match train.py
+    return (grounded[:, 2:] > 0.5).any(dim=-1)  # match train.py
 
 
 def pad_skill(raw):
