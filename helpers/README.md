@@ -1,31 +1,20 @@
 # helpers
 
-Turns mocap into reference clips a policy can actually track.
+Turns mocap into clips a policy can actually track.
 
-A clip has to obey physics or the imitation reward is unreachable: airborne, the centre
-of mass must follow a parabola under gravity and angular momentum must stay constant.
-Hand animation breaks this routinely. These tools detect it and correct it, changing
-only root translation and flight timing — joint angles, style and limb timing survive.
+The catch is that a clip has to obey physics or the reward is impossible to earn — in
+the air the body has to fall like a thrown object and can't change its spin. Hand
+animation breaks this all the time. These tools spot it and fix it by nudging only
+where the body travels and how long it hangs, so the pose and style stay as animated.
 
 ```bash
-python use.py                    # list clips with a physics report
-python use.py backflip           # make one live for the sim and training
+python use.py                    # list clips, with a note on which are physical
+python use.py backflip           # make one live
 python checkclip.py ../animations/backflip.csv
 python build.py dm spinkick      # retarget a DeepMimic clip from clips/
-python build.py all              # rebuild the standard set
+python build.py all              # rebuild everything
 ```
 
-| file | role |
-|---|---|
-| `dm_common.py` | skeleton definition, quaternion and FK helpers |
-| `dm_native.py` | reads DeepMimic clip files |
-| `retarget.py` | DeepMimic humanoid3d → mma joint rotations |
-| `ballistic.py` | flight retiming and parabolic COM correction |
-| `angular.py` | angular momentum conservation during flight |
-| `checkclip.py` | the gate: implied gravity, drift, joint speed |
-| `writecsv.py` | writes the 150-column CSV and the training npz |
-| `build.py` | ties the above together |
-| `use.py` | selects the live clip |
-| `bake_npz.py` | CSV → npz only, when the clip needs no correction |
-
-`clips/` holds the raw DeepMimic source files.
+`use.py` and `checkclip.py` are the two you'll actually use day to day. The rest
+(`retarget`, `ballistic`, `angular`, `writecsv`, `dm_common`, `dm_native`) are the
+pipeline underneath, and `clips/` holds the raw DeepMimic files.
