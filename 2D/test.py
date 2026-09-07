@@ -58,8 +58,7 @@ model.eval()
 
 
 class Env:
-    # reward n' done functions (kept identical to training script,
-    # only used here so udp.step() still works without changes)
+    # reward n' done functions (kept identical to training script, only used
     def getReward(self, state):
         b_ang = torch.atan2(state[:, 3], state[:, 4])
         upright = torch.exp(-4.0 * (b_ang - math.pi / 2) ** 2)

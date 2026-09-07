@@ -89,13 +89,13 @@ struct Engine {
     )glsl";
 
     Engine() {
-        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11); // GLEW needs a GLX context; native Wayland breaks glewInit()
+        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11); // GLEW needs a GLX context
         if (!glfwInit()) exit(-1);
         glfwWindowHintString(GLFW_X11_CLASS_NAME, "mma3d");
         glfwWindowHintString(GLFW_X11_INSTANCE_NAME, "mma3d");
         window = glfwCreateWindow(width, height, "3D Viewer", NULL, NULL);
         glfwMakeContextCurrent(window);
-        glfwSwapInterval(0); // decouple swap from vsync so low frameDivider values stay responsive
+        glfwSwapInterval(0); // decouple swap from vsync
         glewInit();
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
@@ -340,18 +340,20 @@ struct Bone {
 struct Joint {
     Bone *A, *B;
     vec3 anchorA, anchorB;
-    float maxTorque = 200.0f;
+    float maxTorque = 1000.0f;
     vec3 targetAngle = vec3(0);
     float stiffness = 1.0f;
     float damping;
+    float kGain;
 
-    Joint(Bone* a, Bone* b, vec3 anchorA, vec3 anchorB, vec3 targetAngle, float stiffness = 1.0f, float maxTorque = 200.0f)
+    Joint(Bone* a, Bone* b, vec3 anchorA, vec3 anchorB, vec3 targetAngle, float stiffness = 1.0f, float maxTorque = 1000.0f, float gainTorque = -1.0f)
         : A(a), B(b), anchorA(anchorA), anchorB(anchorB), maxTorque(maxTorque), targetAngle(targetAngle), stiffness(stiffness) {
-        // damp relative to THIS joint's inertia (child body about the anchor), not one global
-        // ratio. k/50 gave zeta ~0.7 everywhere except the ankle, where the foot is so light
-        // it came out at 2.7 - damping alone ate 77% of the ankle's torque during a jump.
+  
+            float gt = gainTorque > 0.0f ? gainTorque : maxTorque;
+        // damp against this joint's own inertia, not one global ratio
         float I = 1.0f / b->invInertiaBody[2][2] + b->mass * dot(anchorB, anchorB);
-        damping = 1.4f * sqrt(stiffness * maxTorque * I);   // 1.4 = 2*zeta, zeta = 0.7
+        damping = 0.8f * sqrt(stiffness * gt * I);   // zeta = 0.4, tuned for tracking
+        kGain   = stiffness * gt;
     }
 
     void solve(float dt) {
@@ -388,9 +390,7 @@ struct Joint {
         vec3 error = s < 1e-6f ? vec3(0) : A->orient * ((2.0f * atan2(s, dq.w)) * (v / s));
         vec3 angVel = B->angVel - A->angVel;
 
-        float k = stiffness * maxTorque;
-
-        vec3 torque = k * error - damping * angVel;
+        vec3 torque = kGain * error - damping * angVel;
         if (length(torque) > maxTorque) torque = maxTorque * normalize(torque);
 
         vec3 impulse = torque * dt;
@@ -450,21 +450,19 @@ struct Skeleton {
         auto bot = [=](Bone* b) { return vec3( b->dims.x + b->dims.y + gap, 0, 0); };
         float hp = float(M_PI) / 2.0f;
 
-        joints.push_back(Joint(pelvis, abs,      vec3(0,  0.0791f, 0),          vec3(0, -0.0791f, 0),      vec3(0, 0, 0),   2.0f, 150.0f));
-        joints.push_back(Joint(abs,    chest,    vec3(0,  0.0791f, 0),          vec3(0, -0.1055f, 0),      vec3(0, 0, 0),   2.0f, 200.0f));
+        joints.push_back(Joint(pelvis, abs,      vec3(0,  0.0791f, 0),          vec3(0, -0.0791f, 0),      vec3(0, 0, 0),   5.0f, 150.0f));
+        joints.push_back(Joint(abs,    chest,    vec3(0,  0.0791f, 0),          vec3(0, -0.1055f, 0),      vec3(0, 0, 0),   5.0f, 200.0f));
         joints.push_back(Joint(chest,  head,     vec3(0,  0.1275f, 0),          vec3(0, -0.0923f, 0),      vec3(0, 0, 0),   2.0f, 50.0f));
-        joints.push_back(Joint(chest,  armR,     vec3(0,  0.0703f,  shoulderZ), top(armR),                 vec3(0, 0, -hp), 2.0f, 100.0f));
-        joints.push_back(Joint(chest,  armL,     vec3(0,  0.0703f, -shoulderZ), top(armL),                 vec3(0, 0, -hp), 2.0f, 100.0f));
-        joints.push_back(Joint(armR,   forearmR, bot(armR),                     top(forearmR),             vec3(0, 0, 0),   2.0f, 60.0f));
-        joints.push_back(Joint(armL,   forearmL, bot(armL),                     top(forearmL),             vec3(0, 0, 0),   2.0f, 60.0f));
-        joints.push_back(Joint(pelvis, thighR,   vec3(0, -0.0703f,  hipZ-0.0220f), top(thighR),             vec3(0, 0, -hp), 4.0f, 200.0f));
-        joints.push_back(Joint(pelvis, thighL,   vec3(0, -0.0703f, -hipZ+0.0220f), top(thighL),             vec3(0, 0, -hp), 4.0f, 200.0f));
-        joints.push_back(Joint(thighR, calfR,    bot(thighR),                   top(calfR),                vec3(0, 0, 0),   4.0f, 150.0f));
-        joints.push_back(Joint(thighL, calfL,    bot(thighL),                   top(calfL),                vec3(0, 0, 0),   4.0f, 150.0f));
-        // ankle 90 -> 150: toe-off needs ~106 Nm to pass 3.2x bodyweight through the foot's
-        // 0.15 m lever. 150 Nm at 45 kg is in the human plantarflexion range for a jump.
-        joints.push_back(Joint(calfR,  footR,    bot(calfR),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 150.0f));
-        joints.push_back(Joint(calfL,  footL,    bot(calfL),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 150.0f));
+        joints.push_back(Joint(chest,  armR,     vec3(0,  0.0703f,  shoulderZ), top(armR),                 vec3(0, 0, -hp), 4.0f, 100.0f));
+        joints.push_back(Joint(chest,  armL,     vec3(0,  0.0703f, -shoulderZ), top(armL),                 vec3(0, 0, -hp), 4.0f, 100.0f));
+        joints.push_back(Joint(armR,   forearmR, bot(armR),                     top(forearmR),             vec3(0, 0, 0),   5.0f, 60.0f));
+        joints.push_back(Joint(armL,   forearmL, bot(armL),                     top(forearmL),             vec3(0, 0, 0),   5.0f, 60.0f));
+        joints.push_back(Joint(pelvis, thighR,   vec3(0, -0.0703f,  hipZ-0.0220f), top(thighR),             vec3(0, 0, -hp), 4.0f, 400.0f, 200.0f));
+        joints.push_back(Joint(pelvis, thighL,   vec3(0, -0.0703f, -hipZ+0.0220f), top(thighL),             vec3(0, 0, -hp), 4.0f, 400.0f, 200.0f));
+        joints.push_back(Joint(thighR, calfR,    bot(thighR),                   top(calfR),                vec3(0, 0, 0),   4.0f, 700.0f, 150.0f));
+        joints.push_back(Joint(thighL, calfL,    bot(thighL),                   top(calfL),                vec3(0, 0, 0),   4.0f, 700.0f, 150.0f));
+        joints.push_back(Joint(calfR,  footR,    bot(calfR),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 500.0f, 150.0f));
+        joints.push_back(Joint(calfL,  footL,    bot(calfL),                    vec3(-0.0308f, 0.0110f, 0), vec3(0, 0, hp),  5.0f, 500.0f, 150.0f));
 
         for (Joint& j : joints) {
             vec3 err = (j.A->pos + j.A->orient * j.anchorA) - (j.B->pos + j.B->orient * j.anchorB);
@@ -472,7 +470,7 @@ struct Skeleton {
         }
     }
 
-    void getPos(int frame = -1, float phase01 = -1.0f) {
+    static const vector<vector<float>>& refFrames() {
         static vector<vector<float>> frames;
         if (frames.empty()) {
             ifstream f;
@@ -489,47 +487,60 @@ struct Skeleton {
                 if (row.size() >= 136) frames.push_back(row);
             }
         }
+        return frames;
+    }
+
+    void getPos(int frame = -1, float phase01 = -1.0f) {
+        const vector<vector<float>>& frames = refFrames();
         if (frames.empty()) return;
 
         if (phase01 >= 0.0f) frame = (int)std::round(phase01 * (frames.size() - 1));
         else if (frame < 0) frame = rand() % frames.size();
-        vector<float>& row = frames[glm::clamp(frame, 0, (int)frames.size() - 1)];
+        frame = glm::clamp(frame, 0, (int)frames.size() - 1);
 
-        quat jointQuat[13];
-        for (int j = 0; j < 13; j++)
-            jointQuat[j] = quat(row[j*4], row[j*4+1], row[j*4+2], row[j*4+3]);
+        // pose only; called at f-1, f+1 and f to get velocities by difference
+        auto applyPose = [&](int fr) {
+            const vector<float>& r = frames[glm::clamp(fr, 0, (int)frames.size() - 1)];
+            for (int i = 0; i < (int)bones.size(); i++)
+                bones[i]->pos = vec3(pos.x + r[52 + i*3], r[52 + i*3 + 1], pos.z + r[52 + i*3 + 2]);
+            pelvis->orient = r.size() >= 141 ? quat(r[137], r[138], r[139], r[140]) : quat(1, 0, 0, 0);
+            for (int j = 0; j < (int)joints.size(); j++)
+                joints[j].B->orient = joints[j].A->orient
+                                    * quat(r[j*4], r[j*4+1], r[j*4+2], r[j*4+3]);
+        };
+
+        // central difference of the baked frames, per link
+        const float refDt = 1.0f / 30.0f;
+        vector<vec3> pPrev(bones.size()), pNext(bones.size());
+        vector<quat> oPrev(bones.size()), oNext(bones.size());
+        applyPose(frame - 1);
+        for (int i = 0; i < (int)bones.size(); i++) { pPrev[i] = bones[i]->pos; oPrev[i] = bones[i]->orient; }
+        applyPose(frame + 1);
+        for (int i = 0; i < (int)bones.size(); i++) { pNext[i] = bones[i]->pos; oNext[i] = bones[i]->orient; }
+        applyPose(frame);
+
+        // one-sided window at the clip ends
+        float span = 2.0f * refDt;
+        if (frame == 0 || frame == (int)frames.size() - 1) span = refDt;
 
         for (int i = 0; i < (int)bones.size(); i++) {
-            bones[i]->pos = vec3(pos.x + row[52 + i*3], row[52 + i*3 + 1], pos.z + row[52 + i*3 + 2]);
-            // grounded is only written by floorCollision, which runs inside step(). a reset
-            // teleports without stepping, so without this the contact flags from the fall
-            // survive into the next state and python reads the fresh pose as "already down".
+            bones[i]->vel = (pNext[i] - pPrev[i]) / span;
+            quat dq = oNext[i] * inverse(oPrev[i]);
+            if (dq.w < 0) dq = -dq;
+            vec3 v(dq.x, dq.y, dq.z);
+            float s = length(v);
+            bones[i]->angVel = s < 1e-9f ? vec3(0) : ((2.0f * atan2(s, dq.w)) / span) * (v / s);
+            // a reset teleports without stepping, so stale contact flags must be cleared
             bones[i]->grounded = false;
         }
 
-        // pelvis world orientation, columns 137-140 (absent in old bakes -> identity)
-        pelvis->orient = row.size() >= 141 ? quat(row[137], row[138], row[139], row[140]) : quat(1, 0, 0, 0);
-        // root linear/angular velocity, columns 144-149 (absent in bakes made before
-        // this was added -> falls back to 0, same as before)
-        pelvis->vel = row.size() >= 150 ? vec3(row[144], row[145], row[146]) : vec3(0);
-        pelvis->angVel = row.size() >= 150 ? vec3(row[147], row[148], row[149]) : vec3(0);
-
+        const vector<float>& row = frames[frame];
         for (int j = 0; j < (int)joints.size(); j++) {
-            Joint& jt = joints[j];
-            jt.B->orient = jt.A->orient * jointQuat[j];
-            jt.B->angVel = jt.A->angVel + jt.A->orient * vec3(row[94 + j*3], row[94 + j*3 + 1], row[94 + j*3 + 2]);
-            // rigid-body velocity transport: child inherits parent's linear velocity
-            // plus the extra linear motion caused by the parent spinning while the
-            // child sits away from it (cross(parent angvel, offset)) — no per-joint
-            // linear velocity is baked, so this is the physically correct way to get
-            // every limb moving with the body instead of only the pelvis having velocity.
-            jt.B->vel = jt.A->vel + cross(jt.A->angVel, jt.B->pos - jt.A->pos);
-
-            quat q = jointQuat[j];
+            quat q(row[j*4], row[j*4+1], row[j*4+2], row[j*4+3]);
             if (q.w < 0) q = -q;
             vec3 v(q.x, q.y, q.z);
             float s = length(v);
-            jt.targetAngle = s < 1e-6f ? vec3(0) : (2.0f * atan2(s, q.w)) * (v / s);
+            joints[j].targetAngle = s < 1e-6f ? vec3(0) : (2.0f * atan2(s, q.w)) * (v / s);
         }
     }
 
@@ -561,6 +572,7 @@ struct Skeleton {
             else            for (int n = joints.size() - 1; n >= 0; n--)  { joints[n].solve(dt); joints[n].applyTorque(dt / iters); }
         }
 
+
         for (Bone* b : bones) {
             b->vel    = glm::clamp(b->vel, vec3(-100.0f), vec3(100.0f));
             b->angVel = glm::clamp(b->angVel, vec3(-50.0f), vec3(50.0f));
@@ -591,8 +603,8 @@ struct Skeleton {
         mat3 invI = R * b->invInertiaBody * transpose(R);
         vec3 n(0, 1, 0);
 
-        float maxPen = 0.0f;      // clamped at 0, drives the positional correction below
-        float nearest = -1e9f;    // true signed distance, drives the grounded flag
+        float maxPen = 0.0f;      // drives the positional correction
+        float nearest = -1e9f;    // drives the grounded flag
         vector<float> jnAcc(pts.size(), 0.0f), jtAcc(pts.size(), 0.0f);
         for (int iter = 0; iter < 8; iter++) {
             for (size_t i = 0; i < pts.size(); i++) {
@@ -611,9 +623,7 @@ struct Skeleton {
                 float denom = b->invMass + dot(cross(invI * cross(rw, n), rw), n);
                 if (denom == 0) continue;
 
-                // speculative contact: while still separated by `gap`, the bone is allowed to
-                // approach at gap/dt so it lands ON the surface. killing all normal velocity
-                // the moment it entered the 5 cm margin left it hovering there permanently.
+                // speculative contact: approach at gap/dt so the bone lands on the surface
                 float vTarget = glm::min(penetration, 0.0f) / dt;
                 float jn = -(1.0f + restitution) * (vn - vTarget) / denom;
                 float jnNew = glm::max(jnAcc[i] + jn, 0.0f);
@@ -639,46 +649,29 @@ struct Skeleton {
             }
         }
         b->pos += n * (percent * glm::max(maxPen - slop, 0.0f));
-        // "in contact", not "overlapping". requiring strict penetration made this fire only on
-        // violent impacts and never on a settled body, so isDone never terminated a fall.
+        // in contact, not overlapping: a settled body must still read as grounded
         b->grounded = nearest > -0.02f;
     }
 };
-vector<Skeleton*> envs {
-    new Skeleton(vec3(0, 0, 0), 0),
-
-    new Skeleton(vec3(3, 0, 0), 1),
-    new Skeleton(vec3(-3, 0, 0), 2),
-    new Skeleton(vec3(0, 0, 3), 3),
-    new Skeleton(vec3(0, 0, -3), 4),
-    new Skeleton(vec3(3, 0, -3), 5),
-    new Skeleton(vec3(-3, 0, 3), 6),
-    new Skeleton(vec3(3, 0, 3), 7),
-    new Skeleton(vec3(-3, 0, -3), 8),
-
-    new Skeleton(vec3(6, 0, 0), 9),
-    new Skeleton(vec3(-6, 0, 0), 10),
-    new Skeleton(vec3(0, 0, 6), 11),
-    new Skeleton(vec3(0, 0, -6), 12),
-    new Skeleton(vec3(6, 0, -6), 13),
-    new Skeleton(vec3(-6, 0, 6), 14),
-    new Skeleton(vec3(6, 0, 6), 15),
-    new Skeleton(vec3(-6, 0, -6), 16),
-
-    new Skeleton(vec3(6, 0, 3), 17),
-    new Skeleton(vec3(6, 0, -3), 18),
-    new Skeleton(vec3(3, 0, 6), 19),
-    new Skeleton(vec3(-3, 0, 6), 20),
-    new Skeleton(vec3(3, 0, -6), 21),
-    new Skeleton(vec3(-3, 0, -6), 22),
-    new Skeleton(vec3(-6, 0, 3), 23),
-    new Skeleton(vec3(-6, 0, -3), 24),
-
-};
+// -DNUM_ENVS=1 for single-env playback (test.py); the default 25 is what train.py expects
+#ifndef NUM_ENVS
+#define NUM_ENVS 25
+#endif
+vector<Skeleton*> makeEnvs() {
+    // spread the humanoids over a grid so they never overlap
+    vector<Skeleton*> v;
+    const int side = (int)ceil(sqrt((float)NUM_ENVS));
+    for (int i = 0; i < NUM_ENVS; i++) {
+        int r = i / side, c = i % side;
+        v.push_back(new Skeleton(vec3(3.0f * (c - side / 2), 0, 3.0f * (r - side / 2)), i));
+    }
+    return v;
+}
+vector<Skeleton*> envs = makeEnvs();
 
 // ================= UDP ================= //
-const int ACTION_DIM = 3 * 13;      // 3 axis per joint
-const int STATE_DIM  = 2 + 14 * 14; // phase, root_height, then 14 links x [pos3 quat4 linvel3 angvel3 grounded1]
+const int ACTION_DIM = 3 * 13;      // 3 axes per joint
+const int STATE_DIM  = 2 + 14 * 14; // phase, root height, 14 links x [pos3 quat4 vel3 angvel3 grounded1]
 struct Data {
     int sock, sendSock;
     sockaddr_in server, python;
@@ -703,7 +696,7 @@ struct Data {
         vector<float> recvBuffer(envs.size() * ACTION_DIM);
         int bytesRead = recv(sock, (char*)recvBuffer.data(), recvBuffer.size() * sizeof(float), MSG_DONTWAIT);
         if (bytesRead < (int)(2 * sizeof(float))) {
-            std::this_thread::sleep_for(std::chrono::microseconds(200)); // don't busy-spin a full core while idle
+            std::this_thread::sleep_for(std::chrono::microseconds(200)); // don't busy-spin while idle
             return 0;
         }
 
@@ -711,10 +704,10 @@ struct Data {
             return 1; // asking for state, no step
         } else if (recvBuffer[0] == -69.0f) {
             int idx = (int)recvBuffer[1];
-            float phase = recvBuffer[2]; // train.py's send_reset(env_idx, phase)
+            float phase = recvBuffer[2];
             if (idx >= 0 && idx < (int)envs.size()) {
                 Skeleton* env = envs[idx];
-                env->getPos(-1, phase); // same frame train.py's Reference.idx(phase) picks
+                env->getPos(-1, phase);
             }
             return 2;
         } else if (bytesRead == (int)(envs.size() * ACTION_DIM * sizeof(float))) {
@@ -725,9 +718,11 @@ struct Data {
                     i += 3;
                 }
             float dt = 1.0f / 30.0f;
+
             #pragma omp parallel for
             for (int e = 0; e < (int)envs.size(); e++)
                 for (int s = 0; s < 40; s++) envs[e]->step(dt / 40.0f);
+
             return 1;
         }
         return 2;
@@ -763,13 +758,11 @@ Data udp;
 
 int frameDivider = 1;
 void KeyControl(GLFWwindow* window) {
-    // Static variables keep their state across frames, safely hidden inside this function
     static int modes[3] = {1, 500, 50000};
     static int currentMode = 0;
-    static int timer = 0;
     static bool bPressedLastFrame = false;
 
-    // 1. Toggle Logic with a simple debounce (so it doesn't rapid-fire cycle)
+    // debounced toggle: B cycles render frequency
     bool bPressed = (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS);
     if (bPressed && !bPressedLastFrame) {
         currentMode = (currentMode + 1) % 3;
@@ -789,8 +782,7 @@ int main() {
     while (!glfwWindowShouldClose(engine.window)) {
         KeyControl(engine.window);
 
-        // drain everything queued this frame. one datagram per rendered frame meant a batch
-        // of 25 resets took 25 frames to apply, so envs visibly sat on the floor meanwhile.
+        // drain the queue: a batch of 25 resets must not take 25 frames to apply
         for (int n = 0; n < 64; n++) {
             int r = udp.receiveData();
             if (r == 0) break;

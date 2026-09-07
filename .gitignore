@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+mma
+mma2d
+POLICY_3D_best.pt

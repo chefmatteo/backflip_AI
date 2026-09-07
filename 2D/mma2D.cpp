@@ -287,9 +287,9 @@ struct Skeleton {
             if (foot.y < b->radius + 2.0f)
                 b->vel.x *= 0.05f;
         }
-        maybeApplyImpulse();
+        ApplyImpulse();
     }
-    void maybeApplyImpulse() {
+    void ApplyImpulse() {
         if (impulse_max <= 0.0f) return;
         impulse_timer++;
         if (impulse_timer < next_impulse_delay) return;
@@ -309,10 +309,7 @@ struct Skeleton {
 
         float dir = (rand() % 2 == 0) ? 1.0f : -1.0f;
         float mag = (0.5f + 0.5f * ((float)rand() / RAND_MAX)) * impulse_max;
-        // mag is calibrated as "velocity the body would get if hit" (matches the original,
-        // pre-normalization system exactly when target==body). Lighter bones still get
-        // proportionally more velocity for the same momentum hit (real physics), same ratio
-        // as before -- this is just a relabeling so impulse_max is comparable to old values.
+        // mag is calibrated as "velocity the body would get if
         target->vel.x += dir * mag * body->mass / target->mass;
     }
 
@@ -331,26 +328,7 @@ struct Skeleton {
             float penetration = 0.0f;
             bool collided = false;
 
-            // if (contact.x < b->radius) {
-            //     normal = vec2(1,0);
-            //     penetration = b->radius - contact.x;
-            //     collided = true;
-            // }
-            // else if (contact.x > engine.WIDTH - b->radius) {
-            //     normal = vec2(-1,0);
-            //     penetration = contact.x - (engine.WIDTH - b->radius);
-            //     collided = true;
-            // }
-            // else if (contact.y < b->radius) {
-            //     normal = vec2(0,1);
-            //     penetration = b->radius - contact.y;
-            //     collided = true;
-            // }
-            // else if (contact.y > engine.HEIGHT - b->radius) {
-            //     normal = vec2(0,-1);
-            //     penetration = contact.y - (engine.HEIGHT - b->radius);
-            //     collided = true;
-            // }
+            // if (contact.x < b->radius) { normal = vec2(1,0); penetration =
             if (contact.y < b->radius) {
                 normal = vec2(0,1);
                 penetration = b->radius - contact.y;

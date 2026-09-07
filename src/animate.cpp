@@ -252,6 +252,15 @@ struct Bone {
         buildMesh();
     }
 
+    // Lowest world-space point of this bone, accounting for orientation
+    float lowestY() const {
+        mat3 R = mat3_cast(orient);
+        if (shape == 1)  // box: support along -y over all 8 corners
+            return pos.y - (fabs(R[0][1]) * dims.x + fabs(R[1][1]) * dims.y + fabs(R[2][1]) * dims.z);
+        // capsule: the two axis endpoints, each expanded by the radius
+        return pos.y - (fabs(R[0][1]) * dims.x + dims.y);
+    }
+
     void buildMesh() {
         vector<float> tris, lines;
         auto pushTri  = [&](vec3 p)         { tris.insert(tris.end(), {p.x, p.y, p.z}); };
@@ -334,16 +343,18 @@ struct Bone {
         engine.createVAO(VAO, VBO, tris.data(), tris.size());
         engine.createVAO(lineVAO, lineVBO, lines.data(), lines.size());
     }
-    void draw() {
+    // tint.x < 0 keeps the bone's colour, alpha < 1 draws an onion-skin ghost
+    void draw(vec3 tint = vec3(-1.0f), float alpha = 1.0f) {
+        vec3 c = tint.x < 0.0f ? color : tint;
         mat4 model = translate(mat4(1.0f), pos) * mat4_cast(orient);
         glUniformMatrix4fv(engine.modelLoc, 1, GL_FALSE, value_ptr(model));
-        glUniform4f(engine.colorLoc, color.r, color.g, color.b, 1.0f);
+        glUniform4f(engine.colorLoc, c.r, c.g, c.b, alpha);
         glBindVertexArray(VAO);
         glDrawArrays(GL_TRIANGLES, 0, vertexCount);
 
-        vec3 lc = color * 0.25f;
+        vec3 lc = c * 0.25f;
         glLineWidth(2.0f);
-        glUniform4f(engine.colorLoc, lc.r, lc.g, lc.b, 1.0f);
+        glUniform4f(engine.colorLoc, lc.r, lc.g, lc.b, alpha);
         glBindVertexArray(lineVAO);
         glDrawArrays(GL_LINES, 0, lineVertexCount);
     }
@@ -485,15 +496,16 @@ struct Skeleton {
         }
     }
 
-    void draw() {
-        for (Bone* b : bones) b->draw();
+    void draw(vec3 tint = vec3(-1.0f), float alpha = 1.0f) {
+        for (Bone* b : bones) b->draw(tint, alpha);
+        if (alpha < 1.0f) return;   // ghosts: bones only, no joint balls or clavicles
 
         // dark sphere at every joint anchor
         for (Joint& j : joints) {
             ball->pos = j.A->pos + j.A->orient * j.anchorA;
             ball->draw();
         }
-        // clavicles: pinned to the chest, capsule axis turned to run along z toward each shoulder
+        // clavicles: pinned to the chest, axis along z
         float hp = float(M_PI) / 2.0f;
         clavR->pos = chest->pos + chest->orient * vec3(0, 0.0703f, 0.0923f);
         clavR->orient = chest->orient * angleAxis(-hp, vec3(0, 1, 0));
@@ -545,12 +557,13 @@ struct Skeleton {
     }
 
     void snapToGround() {
-        float lowest = glm::min(footR->pos.y - footR->dims.y, footL->pos.y - footL->dims.y);
+        float lowest = glm::min(glm::min(footR->lowestY(), footL->lowestY()),
+                                 glm::min(forearmR->lowestY(), forearmL->lowestY()));
         vec3 shift(0, -lowest, 0);
         for (Bone* b : bones) b->pos += shift;
     }
     void clampAboveGround() {
-        float lowest = glm::min(footR->pos.y - footR->dims.y, footL->pos.y - footL->dims.y);
+        float lowest = glm::min(footR->lowestY(), footL->lowestY());
         if (lowest >= 0.0f) return;
         vec3 shift(0, -lowest, 0);
         for (Bone* b : bones) b->pos += shift;
@@ -600,8 +613,7 @@ struct Skeleton {
                 b->vel += n * (jn * b->invMass);
                 b->angVel += invI * cross(rw, n * jn);
 
-                // Coulomb friction against the accumulated normal impulse, floored by the
-                // gravity support impulse so a resting contact still has static friction.
+                // Coulomb friction, floored by the gravity support impulse
                 float budget = friction * glm::max(jnAcc[i], b->mass * 9.81f * dt) - jtAcc[i];
                 vel = b->vel + cross(b->angVel, rw); // recompute after normal impulse
                 vec3 vt = vel - dot(vel, n) * n;
@@ -618,7 +630,7 @@ struct Skeleton {
                 }
             }
         }
-        // one positional correction for the deepest point, not per-contact — pushing per
+        // one positional correction for the deepest point
         // corner over-lifts a flat foot by up to 4x
         b->pos += n * (percent * glm::max(maxPen - slop, 0.0f));
     }
@@ -630,11 +642,7 @@ vector<Skeleton*> envs {
     // new Skeleton(vec3(0, 0, 20), 1),
 };
 
-// ================= axis gizmo ================= //
-// X/Y/Z picks a rotation axis on the selected joint (ESC releases it). Two input
-// modes, toggled with UP: mouse mode = click-drag to rotate; arrow mode =
-// LEFT/RIGHT keys rotate. Rotation happens in the parent bone's frame, pivoting
-// at the joint anchor.
+// ================= axis gizmo ================= // X/Y/Z picks a rotation axis
 struct AxisGizmo {
     int axis = -1;          // -1 = off, 0/1/2 = x/y/z
     int jointIdx = 0;       // shared "selected joint" (DOWN cycles it in KeyControl)
@@ -658,21 +666,14 @@ struct AxisGizmo {
         ta = s < 1e-6f ? vec3(0) : (2.0f * atan2(s, q.w)) * (v / s);
     }
 
-    // Builds the pelvis quaternion from three INDEPENDENT unwrapped angles (see the
-    // comment on Keyframe::pelvisRot) instead of treating the vec3 as an axis-angle —
-    // applied X then Y then Z, each about the fixed world axis.
+    // Builds the pelvis quaternion from three INDEPENDENT unwrapped angles (see
     static quat pelvisQuat(vec3 eulerXYZ) {
         return angleAxis(eulerXYZ.z, vec3(0, 0, 1))
              * angleAxis(eulerXYZ.y, vec3(0, 1, 0))
              * angleAxis(eulerXYZ.x, vec3(1, 0, 0));
     }
 
-    // Pelvis isn't a Joint (it's the FK root, so it has no parent/anchor to pivot
-    // on) — rotate it in place about the picked world axis. Unlike joint rotation,
-    // this accumulates as a plain unbounded angle per axis (never wrapped through a
-    // quaternion round-trip), so a continuous multi-revolution spin (e.g. a
-    // backflip) keeps counting past 360 degrees instead of folding back to the
-    // short way when interpolated between keyframes.
+    // Pelvis isn't a Joint (it's the FK root, so it
     void rotatePelvis(Skeleton* e, glm::vec3& accum, float dx) {
         if (axis >= 0) accum[axis] += dx * sens;
         e->pelvis->orient = pelvisQuat(accum);
@@ -730,11 +731,7 @@ struct AxisGizmo {
 };
 AxisGizmo gizmo;
 
-// ================= timeline UI ================= //
-// 2D bar at the bottom: drag the playhead to scrub, drag keyframe dots to move
-// them, SPACE = add/replace keyframe at the playhead, V/C = play/pause,
-// ENTER = bake first->last keyframe to baked_motion.csv (also reloaded as
-// editable keyframes on restart).
+// ================= timeline UI ================= // 2D bar at the bottom:
 struct TimelineUI {
     std::vector<Keyframe> keys; // always kept sorted by time
     float span = 5.0f;          // hard capacity: loaded animations longer than this are squashed to fit
@@ -746,12 +743,7 @@ struct TimelineUI {
     float barH = 46.0f, pad = 18.0f;
     GLuint VAO = 0, VBO = 0;
 
-    // --- view window: what the track actually displays, separate from span (the
-    // hard 5s capacity). fitView() resets it to exactly [first, last] keyframe —
-    // matching what saveCSV bakes — and is called whenever keyframes structurally
-    // change (load/add/paste/delete). -/= (zoom()) shrink/grow it around the
-    // playhead so zooming in keeps whatever moment the cursor is on under roughly
-    // the same screen position; zooming persists until keyframes change again.
+    // --- view window: what the track actually displays, separate from
     float viewStart = 0.0f, viewLen = 5.0f; // starts equal to span (empty timeline, nothing to fit yet)
     float minViewLen = 0.1f; // don't let zoom-in shrink the view to something unusable
 
@@ -772,17 +764,21 @@ struct TimelineUI {
     float trackY()  { return barTop() + barH / 2.0f; }
     float trackX0() { return pad * 2.0f; }
     float trackX1() { return engine.width - pad * 2.0f; }
+    // baked-CSV row index under the playhead
+    int frameAt(float t) {
+        if (keys.size() < 2) return -1;
+        return int(std::round((t - keys.front().time) * 30.0f));
+    }
+    int frameCount() {
+        if (keys.size() < 2) return 0;
+        return int((keys.back().time - keys.front().time) * 30.0f) + 1;
+    }
+
     float xAt(float t)  { return trackX0() + (t - viewStart) / viewLen * (trackX1() - trackX0()); }
     float tAt(double x) { return viewStart + glm::clamp(float(x - trackX0()) / (trackX1() - trackX0()), 0.0f, 1.0f) * viewLen; }
     bool contains(double x, double y) { return y > barTop() - 4.0f; }
 
-    // Catmull-Rom spline through p1->p2 (the segment being played), using p0/p3 as
-    // the neighboring keyframes to set the tangent at each end. Unlike a per-segment
-    // ease (which only shapes one segment in isolation), this makes velocity
-    // continuous ACROSS every keyframe — no ramp-to-zero-then-snap-back-to-speed
-    // discontinuity at the keyframe itself, which is what plain segment easing had.
-    // At the ends of the clip (no neighbor to borrow), the missing point is
-    // mirrored off the segment itself so the curve doesn't overshoot at the edges.
+    // Catmull-Rom spline through p1->p2 (the segment being played), using p0/p3
     static glm::vec3 catmullRom(glm::vec3 p0, glm::vec3 p1, glm::vec3 p2, glm::vec3 p3, float t) {
         float t2 = t * t, t3 = t2 * t;
         return 0.5f * ((2.0f * p1) +
@@ -791,13 +787,10 @@ struct TimelineUI {
                        (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
     }
 
-    // --- mouse ---
-    // grabbing anything in the timeline always returns to the saved animation:
-    // back to animate mode, and unsaved pose edits / physics wreckage get
-    // overwritten by applyPose on the next frame
+    // --- mouse --- grabbing anything in the timeline always returns
     void grab() { currentMode = ANIMATE; }
     void mouseDown(double x, double y) {
-        // dots first, then the playhead; clicking empty track does nothing (no click-to-jump)
+        // dots first, then the playhead
         for (int i = 0; i < (int)keys.size(); i++)
             if (fabs(x - xAt(keys[i].time)) < 7.0 && fabs(y - trackY()) < 12.0) { dragKey = i; selKey = i; grab(); return; }
         selKey = -1; // clicked off the dots: deselect
@@ -807,7 +800,7 @@ struct TimelineUI {
         if (dragKey >= 0) {
             float t = tAt(x);
             keys[dragKey].time = t;
-            // bubble the dragged key so the vector stays sorted while it moves past neighbors
+            // bubble the dragged key so the vector stays sorted
             while (dragKey > 0 && keys[dragKey - 1].time > t) { std::swap(keys[dragKey - 1], keys[dragKey]); dragKey--; }
             while (dragKey + 1 < (int)keys.size() && keys[dragKey + 1].time < t) { std::swap(keys[dragKey + 1], keys[dragKey]); dragKey++; }
             selKey = dragKey;
@@ -819,8 +812,10 @@ struct TimelineUI {
     glm::vec3 pelvisOffset = glm::vec3(0); // edited live in ANIMATE mode, baked into new keyframes
     glm::vec3 pelvisRot    = glm::vec3(0); // unwrapped per-axis angles (see Keyframe::pelvisRot)
     void addKey(Skeleton* e) {
+        // half a frame at 30 Hz
+        const float KEY_SNAP = 0.5f / 30.0f;
         for (Keyframe& k : keys)
-            if (fabs(k.time - cursor) < 0.05f) { // re-key on top of an existing dot = replace it
+            if (fabs(k.time - cursor) < KEY_SNAP) { // re-key on top of an existing dot = replace it
                 k.angles.clear();
                 for (Joint& j : e->joints) k.angles.push_back(j.targetAngle);
                 k.pelvisOffset = pelvisOffset;
@@ -886,9 +881,7 @@ struct TimelineUI {
     void applyPose(Skeleton* e) {
         if (keys.empty()) return;
         for (Bone* b : e->bones) { b->vel = vec3(0); b->angVel = vec3(0); } // physics tests restart clean
-        // FK only poses children off the pelvis, so after a physics fall the model
-        // would otherwise stay tipped over/displaced — the keyframed pelvisOffset/
-        // pelvisRot are what re-place the root, layered on top of the fixed home pose.
+        // FK only poses children off the pelvis, so after a
         if (keys.size() == 1) {
             for (int j = 0; j < 13; j++) e->joints[j].targetAngle = keys[0].angles[j];
             pelvisOffset = keys[0].pelvisOffset;
@@ -902,8 +895,6 @@ struct TimelineUI {
         while (k < (int)keys.size() - 2 && t >= keys[k + 1].time) k++;
         float blend = glm::clamp((t - keys[k].time) / glm::max(keys[k + 1].time - keys[k].time, 1e-6f), 0.0f, 1.0f);
         // Catmull-Rom through the whole keyframe sequence (see catmullRom() above) —
-        // velocity is continuous across every keyframe, not just smoothed within one
-        // segment, so there's no ramp-down-then-snap-back-to-speed at the dots.
         int kPrev = glm::max(k - 1, 0);
         int kNext = glm::min(k + 2, (int)keys.size() - 1);
         for (int j = 0; j < 13; j++)
@@ -911,9 +902,7 @@ struct TimelineUI {
                                                    keys[k + 1].angles[j], keys[kNext].angles[j], blend);
         pelvisOffset = catmullRom(keys[kPrev].pelvisOffset, keys[k].pelvisOffset,
                                    keys[k + 1].pelvisOffset, keys[kNext].pelvisOffset, blend);
-        // pelvisRot is unwrapped (can exceed +-pi per axis), so this spline stays
-        // monotonic across a continuous multi-revolution spin instead of folding
-        // back to the short way the way a quaternion-recovered axis-angle would.
+        // pelvisRot is unwrapped (can exceed +-pi per axis), so this
         pelvisRot = catmullRom(keys[kPrev].pelvisRot, keys[k].pelvisRot,
                                 keys[k + 1].pelvisRot, keys[kNext].pelvisRot, blend);
         e->pelvis->pos = vec3(e->pos.x, 0.9584f, e->pos.z) + pelvisOffset;
@@ -948,9 +937,7 @@ struct TimelineUI {
         return "";
     }
 
-    // --- startup load: read the dense 30 Hz baked_motion.csv, but only import rows
-    // flagged (trailing column) as user-placed keyframes, not the interpolated
-    // in-between frames saveCSV also wrote ---
+    // --- startup load: read the dense 30 Hz baked_motion.csv, but
     bool load(Skeleton* e = nullptr) {
         std::ifstream f(find("baked_motion.csv"));
         if (!f.is_open()) return false;
@@ -978,11 +965,7 @@ struct TimelineUI {
             }
             // pelvis (bones[6]) world position lives at link_p columns 52 + 6*3
             glm::vec3 pelvisWorld(cells[52 + 6*3], cells[52 + 6*3 + 1], cells[52 + 6*3 + 2]);
-            // pelvis unwrapped per-axis rotation: trailing columns 141-143, written
-            // directly (not derived from the quaternion at 137-140) — a single baked
-            // quaternion can't distinguish "5 degrees" from "365 degrees" on some axis,
-            // so the unwrapped angle has to be stored as its own value to round-trip
-            // correctly. Absent in old files (pre-dates pelvis rotation) -> identity.
+            // pelvis unwrapped per-axis rotation: trailing columns 141-143
             glm::vec3 pelvisRotVal = cells.size() >= 144
                 ? glm::vec3(cells[141], cells[142], cells[143]) : glm::vec3(0);
             keys.push_back({ (row - 1) * dt, angles, pelvisWorld - home, pelvisRotVal });
@@ -990,7 +973,7 @@ struct TimelineUI {
         if (!keys.empty()) std::cout << "Loaded " << dir << "baked_motion.csv (" << keys.size() << " keyframes)\n";
         if (keys.empty()) return false;
         std::sort(keys.begin(), keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.time < b.time; });
-        // fit into the fixed-capacity bar: start at 0, squash proportionally if longer
+        // squash proportionally to fit the fixed-capacity bar
         float t0 = keys.front().time;
         for (Keyframe& k : keys) k.time -= t0;
         if (keys.back().time > span) {
@@ -1012,10 +995,7 @@ struct TimelineUI {
         glm::vec3 prevPelvisPos = vec3(e->pos.x, 0.9584f, e->pos.z) + keys[0].pelvisOffset;
         glm::quat prevPelvisOrient = AxisGizmo::pelvisQuat(keys[0].pelvisRot);
 
-        // user keyframe times rarely land exactly on a 30 Hz grid sample, so a fixed
-        // blend-tolerance check on the dense bake loop below would only ever catch
-        // the very first frame. Instead, mark whichever grid row falls nearest each
-        // keyframe's time (within half a frame) as that keyframe's row.
+        // user keyframe times rarely land exactly on a 30 Hz
         std::vector<int> keyRow(keys.size(), -1);
         int totalRows = (int)std::round((keys.back().time - keys.front().time) / dt) + 1;
         for (size_t ki = 0; ki < keys.size(); ki++) {
@@ -1029,8 +1009,6 @@ struct TimelineUI {
             while (k < (int)keys.size() - 2 && t >= keys[k + 1].time) k++;
             float blend = glm::clamp((t - keys[k].time) / glm::max(keys[k + 1].time - keys[k].time, 1e-6f), 0.0f, 1.0f);
             // Catmull-Rom through the whole sequence — see catmullRom() and the
-            // matching comment in applyPose(); keeps velocity continuous across
-            // every keyframe instead of a linear ramp that resets speed at each dot.
             int kPrev = glm::max(k - 1, 0);
             int kNext = glm::min(k + 2, (int)keys.size() - 1);
 
@@ -1041,13 +1019,7 @@ struct TimelineUI {
                 e->joints[j].targetAngle = catmullRom(keys[kPrev].angles[j], keys[k].angles[j],
                                                        keys[k + 1].angles[j], keys[kNext].angles[j], blend);
 
-            // 1b. Interpolate pelvis (root) translation + rotation. pelvisRot is
-            // unwrapped per-axis (never re-derived from a quaternion), so this spline
-            // stays monotonic across a >180 degree spin between two keyframes instead
-            // of folding back to the short way — by the time it's converted to a
-            // quaternion here, dense 30 Hz sampling means every frame-to-frame delta
-            // is small, so this is a per-frame absolute quaternion exactly like any
-            // other DeepMimic-style baked reference clip.
+            // 1b
             vec3 pelvisRotSample = catmullRom(keys[kPrev].pelvisRot, keys[k].pelvisRot,
                                                keys[k + 1].pelvisRot, keys[kNext].pelvisRot, blend);
             e->pelvis->orient = AxisGizmo::pelvisQuat(pelvisRotSample);
@@ -1057,10 +1029,7 @@ struct TimelineUI {
 
             // 2. Apply Forward Kinematics! (No physics solver used here)
             e->updateKinematics();
-            // FK interpolation between two authored keyframes can dip a foot below
-            // the floor even when neither keyframe does — never intentional, so
-            // clamp (not snap: only pushes up, never pulls a clear pose down) every
-            // baked frame the same way the live editor does while scrubbing/playing.
+            // FK interpolation between two authored keyframes can dip a foot
             e->clampAboveGround();
 
             // 3. Write Quats
@@ -1088,28 +1057,14 @@ struct TimelineUI {
             glm::vec3 fCom = com / tMass;
             f << fCom.x << "," << fCom.y << "," << fCom.z << ",";
 
-            // 7. Write keyframe flag + pelvis world orientation (quaternion, what
-            // training actually reads via animate.py's link_p/joint_q — a plain
-            // per-frame absolute quaternion, dense enough that every frame-to-frame
-            // delta is small, exactly like any DeepMimic-style baked reference clip)
-            // + pelvis unwrapped per-axis angle. The quaternion alone can't tell a
-            // reload whether you meant 5 degrees or 365 degrees on some axis (that
-            // winding info doesn't exist in a single absolute orientation), so the
-            // unwrapped angle is also stored directly here — purely for mma.cpp's own
-            // re-load, so re-opening the file restores the keyframes you actually
-            // placed. animate.py/train.py only read the first 136 columns and never
-            // see any of this.
+            // 7
             bool isKey = std::find(keyRow.begin(), keyRow.end(), rowIdx) != keyRow.end();
             f << (isKey ? 1 : 0) << ","
               << e->pelvis->orient.w << "," << e->pelvis->orient.x << ","
               << e->pelvis->orient.y << "," << e->pelvis->orient.z << ","
               << pelvisRotSample.x << "," << pelvisRotSample.y << "," << pelvisRotSample.z << ",";
 
-            // 8. Write root (pelvis) linear + angular velocity — same finite-difference
-            // technique as step 5's joint angular velocity, just applied to the pelvis's
-            // own position/orientation instead of a joint angle. train.py's reward can
-            // then match root velocity the same way DeepMimic's root_err does, instead
-            // of having no reference root velocity to compare against at all.
+            // 8
             glm::vec3 rootLinVel = (e->pelvis->pos - prevPelvisPos) / dt;
             glm::quat dq = e->pelvis->orient * glm::conjugate(prevPelvisOrient);
             if (dq.w < 0) dq = -dq;
@@ -1165,6 +1120,15 @@ struct TimelineUI {
 };
 TimelineUI tl;
 
+// ================= onion skinning ================= // Ghost copies of the pose
+int   onionCount = 0;              // 0 = off
+const int   ONION_STEP  = 2;       // frames between ghosts
+const float ONION_ALPHA = 0.30f;   // nearest ghost; further ones fade
+
+enum OnionDir { ONION_BOTH = 0, ONION_FUTURE = 1, ONION_PAST = 2 };
+int  onionDir   = ONION_BOTH;
+bool onionColor = true;            // false = plain white ghosts
+
 // ================= mouse routing ================= //
 void onMouseButton(GLFWwindow* win, int button, int action, int mods) {
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
@@ -1175,6 +1139,15 @@ void onMouseButton(GLFWwindow* win, int button, int action, int mods) {
             gizmo.dragging = true; // this drag rotates the joint, not the camera
             camera.lastX = x; camera.lastY = y;
             return;
+        }
+        // an axis is picked but the drag will orbit the camera instead
+        // because both blockers are silent modes with no on-screen state
+        if (action == GLFW_PRESS && gizmo.axis >= 0) {
+            if (currentMode != ANIMATE)
+                std::cout << "[GIZMO] axis picked but mode is PHYSICS - press M to return to ANIMATE\n";
+            else if (gizmo.useArrows)
+                std::cout << "[GIZMO] axis picked but input is ARROWS - press UP for mouse drag,"
+                             " or use LEFT/RIGHT to rotate\n";
         }
         if (action == GLFW_RELEASE) { tl.mouseUp(); gizmo.dragging = false; } // fall through so the camera clears its drag too
     }
@@ -1227,7 +1200,7 @@ struct Data {
             return true; // python is asking for state, no step
         } else if (recvBuffer[0] == -69.0f) {
             int idx = (int)recvBuffer[1];
-            // TODO: reset to the reference pose at phase recvBuffer[2] once RSI is wired up;
+            // reset request: the editor has no physics to reset
             // for now this just re-inits to the default standing pose.
             if (idx >= 0 && idx < (int)envs.size()) envs[idx]->init();
             return false;
@@ -1283,7 +1256,7 @@ void KeyControl(GLFWwindow* w) {
                                           "elbowR", "elbowL", "hipR", "hipL", "kneeR", "kneeL",
                                           "ankleR", "ankleL", "pelvis" };
     static int lastPrintedIdx = -1;
-    static bool upPrev = false, downPrev = false, spacePrev = false, enterPrev = false, mPrev = false;
+    static bool upPrev = false, downPrev = false, spacePrev = false, enterPrev = false, mPrev = false, nPrev = false;
     static bool xPrev = false, yPrev = false, zPrev = false, escPrev = false, delPrev = false;
     static bool cPrev = false, vPrev = false, tPrev = false, jPrev = false;
     static bool lPrev = false, kPrev = false, fPrev = false;
@@ -1300,6 +1273,82 @@ void KeyControl(GLFWwindow* w) {
                                              : "[MODE] ANIMATE (pose the character)\n");
     }
     mPrev = mNow;
+
+    // --- FRAME READOUT (N) --- prints the baked_motion.csv row index
+    static const char* ONION_DIR_NAME[3] = {"both", "future only", "past only"};
+    for (int n = 0; n <= 9; n++) {
+        static bool numPrev[10] = {false};
+        bool now = glfwGetKey(w, GLFW_KEY_0 + n) == GLFW_PRESS;
+        if (now && !numPrev[n]) {
+            onionCount = n;
+            if (n == 0) std::cout << "[ONION] off\n";
+            else std::cout << "[ONION] " << n << " ghost(s) per side, every "
+                           << ONION_STEP << " frames, " << ONION_DIR_NAME[onionDir]
+                           << (onionColor ? ", colour\n" : ", white\n");
+        }
+        numPrev[n] = now;
+    }
+
+    // --- ONION DIRECTION (shift+F) / COLOUR (shift+C) ---
+    // plain F is snap-to-ground and ctrl+C is copy-keyframe, so these take shift.
+    static bool oDirPrev = false, oColPrev = false;
+    bool shift = glfwGetKey(w, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS
+              || glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    bool oDirNow = shift && glfwGetKey(w, GLFW_KEY_F) == GLFW_PRESS;
+    if (oDirNow && !oDirPrev) {
+        onionDir = (onionDir + 1) % 3;
+        std::cout << "[ONION] direction: " << ONION_DIR_NAME[onionDir] << "\n";
+    }
+    oDirPrev = oDirNow;
+
+    bool oColNow = shift && glfwGetKey(w, GLFW_KEY_C) == GLFW_PRESS;
+    if (oColNow && !oColPrev) {
+        onionColor = !onionColor;
+        std::cout << "[ONION] " << (onionColor ? "colour (past=orange, future=blue)\n"
+                                               : "plain white\n");
+    }
+    oColPrev = oColNow;
+
+    bool nNow = glfwGetKey(w, GLFW_KEY_N) == GLFW_PRESS;
+    if (nNow && !nPrev) {
+        int f = tl.frameAt(tl.cursor);
+        if (f < 0) std::cout << "[FRAME] need at least 2 keyframes\n";
+        else {
+            std::cout << "[FRAME] " << f << " / " << tl.frameCount() - 1
+                      << "   t=" << tl.cursor << "s\n";
+            // COM velocity by central difference of the pose either side,
+            if (!envs.empty() && tl.keys.size() >= 2) {
+                Skeleton* e0 = envs[0];
+                float saved = tl.cursor;
+                vec3 svPos = e0->pelvis->pos; quat svOri = e0->pelvis->orient;
+                vec3 svAng[13]; for (int j = 0; j < 13; j++) svAng[j] = e0->joints[j].targetAngle;
+                vec3 svOff = tl.pelvisOffset, svRot = tl.pelvisRot;
+                const float dt = 1.0f / 30.0f;
+                float lo = tl.keys.front().time, hi = tl.keys.back().time;
+                auto comAt = [&](float t) {
+                    tl.cursor = glm::clamp(t, lo, hi);
+                    tl.applyPose(e0); e0->updateKinematics();
+                    vec3 c(0.0f); float mt = 0.0f;
+                    for (Bone* b : e0->bones) { c += b->pos * b->mass; mt += b->mass; }
+                    return c / mt;
+                };
+                vec3 cNow = comAt(saved);
+                float tPrev = glm::clamp(saved - dt, lo, hi), tNext = glm::clamp(saved + dt, lo, hi);
+                vec3 cPrev = comAt(tPrev), cNext = comAt(tNext);
+                vec3 vel = (tNext - tPrev) > 1e-6f ? (cNext - cPrev) / (tNext - tPrev) : vec3(0.0f);
+                // restore the live pose: while hand-editing it is the user's
+                tl.cursor = saved; tl.pelvisOffset = svOff; tl.pelvisRot = svRot;
+                for (int j = 0; j < 13; j++) e0->joints[j].targetAngle = svAng[j];
+                e0->pelvis->pos = svPos; e0->pelvis->orient = svOri;
+                e0->updateKinematics();
+                printf("        com pos [%+.3f %+.3f %+.3f]\n"
+                       "        com vel [%+.3f %+.3f %+.3f]  |v| %.3f m/s\n",
+                       cNow.x, cNow.y, cNow.z, vel.x, vel.y, vel.z, length(vel));
+                fflush(stdout);
+            }
+        }
+    }
+    nPrev = nNow;
 
     // --- PLAYBACK (P = play, O = pause) ---
     if (glfwGetKey(w, GLFW_KEY_P) == GLFW_PRESS) tl.play();
@@ -1354,24 +1403,31 @@ void KeyControl(GLFWwindow* w) {
     if (escNow && !escPrev && gizmo.axis >= 0) { gizmo.release(); std::cout << "Axis released\n"; }
     escPrev = escNow;
 
+    // fine steps by default, shift for coarse
+    // hold SHIFT to block things out quickly.
+    bool fast = glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS
+             || glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    bool fine = glfwGetKey(w, GLFW_KEY_LEFT_CONTROL)  == GLFW_PRESS
+             || glfwGetKey(w, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+
     // --- ARROW-KEY ROTATION (LEFT/RIGHT while an axis is picked) ---
     if (gizmo.axis >= 0 && gizmo.useArrows) {
         bool isPelvis = gizmo.jointIdx == (int)e->joints.size();
+        float rstep = fast ? 3.0f : 0.6f;   // 1.4 deg/frame held, vs 0.28 deg/frame fine
         if (glfwGetKey(w, GLFW_KEY_LEFT)  == GLFW_PRESS) {
-            if (isPelvis) gizmo.rotatePelvis(e, tl.pelvisRot, -3.0f);
-            else gizmo.rotate(e->joints[gizmo.jointIdx], -3.0f);
+            if (isPelvis) gizmo.rotatePelvis(e, tl.pelvisRot, -rstep);
+            else gizmo.rotate(e->joints[gizmo.jointIdx], -rstep);
         }
         if (glfwGetKey(w, GLFW_KEY_RIGHT) == GLFW_PRESS) {
-            if (isPelvis) gizmo.rotatePelvis(e, tl.pelvisRot, 3.0f);
-            else gizmo.rotate(e->joints[gizmo.jointIdx], 3.0f);
+            if (isPelvis) gizmo.rotatePelvis(e, tl.pelvisRot, rstep);
+            else gizmo.rotate(e->joints[gizmo.jointIdx], rstep);
         }
     }
 
-    // --- PELVIS TRANSLATION (WASD = x/z, Q/E = y): moves the whole body's root ---
-    // writes straight to e->pelvis->pos so it's visible immediately, and mirrors
-    // into tl.pelvisOffset so SPACE (addKey) captures it into the keyframe
+    // --- PELVIS TRANSLATION (WASD = x/z, Q/E = y): moves
     {
-        float speed = 8.0f * (1.0f / 60.0f); // units/sec at 60fps key-repeat polling
+        // 8.0 m/s crossed the whole 1.7 m body in 0.2
+        float speed = (fast ? 0.5f : fine ? 0.0125f : 0.0625f) * (1.0f / 60.0f);
         vec3 d(0.0f);
         if (glfwGetKey(w, GLFW_KEY_W) == GLFW_PRESS) d.x -= speed;
         if (glfwGetKey(w, GLFW_KEY_S) == GLFW_PRESS) d.x += speed;
@@ -1382,16 +1438,29 @@ void KeyControl(GLFWwindow* w) {
         if (d != vec3(0.0f)) {
             tl.pelvisOffset += d;
             e->pelvis->pos += d;
+            if (d.y != 0.0f) {
+                // COM, not just the pelvis: grfcheck.py's targets are COM heights, and the
+                // pelvis carries only 29 of the 45 kg, so the two move at different rates.
+                float mTot = 0.0f; vec3 com(0.0f);
+                for (Bone* b : e->bones) { com += b->pos * b->mass; mTot += b->mass; }
+                com /= mTot;
+                printf("[ROOT] pelvis y = %.3f   com y = %.3f   (lowest foot %.3f)\n",
+                       e->pelvis->pos.y, com.y,
+                       glm::min(e->footR->lowestY(), e->footL->lowestY()));
+                fflush(stdout);
+            }
         }
     }
 
     // --- SNAP TO GROUND (F): one-shot, only when pressed (not held every frame) ---
-    bool fNow = glfwGetKey(w, GLFW_KEY_F) == GLFW_PRESS;
+    bool fNow = glfwGetKey(w, GLFW_KEY_F) == GLFW_PRESS && !shift;
     if (fNow && !fPrev) {
-        float lowest = glm::min(e->footR->pos.y - e->footR->dims.y, e->footL->pos.y - e->footL->dims.y);
+        float lowest = glm::min(glm::min(e->footR->lowestY(), e->footL->lowestY()),
+                                 glm::min(e->forearmR->lowestY(), e->forearmL->lowestY()));
         tl.pelvisOffset.y -= lowest;
         e->snapToGround();
-        std::cout << "[GROUND] snapped to floor (shifted " << -lowest << " in y)\n";
+        std::cout << "[GROUND] snapped lowest point (foot or hand) to floor (shifted "
+                  << -lowest << " in y)\n";
     }
     fPrev = fNow;
 
@@ -1491,6 +1560,9 @@ int main() {
         "  - / =      zoom timeline out / in (around the playhead)\n"
         "  ENTER      bake baked_motion.csv (first -> last keyframe)\n"
         "  L          log CoM-vs-feet balance offset for the current pose\n"
+        "  0-9        onion-skin ghosts per side (0 = off)\n"
+        "  SHIFT+F    ghost direction: both / future only / past only\n"
+        "  SHIFT+C    ghost colour on/off (off = plain translucent white)\n"
         "  timeline   drag the playhead to scrub, drag dots to move keyframes\n";
 
     if (!envs.empty() && tl.load(envs[0])) // resume the previous animation if one was saved
@@ -1513,13 +1585,50 @@ int main() {
                 bool interpolating = tl.playing || tl.scrubbing || tl.dragKey >= 0;
                 if (interpolating) tl.applyPose(skeleton);
                 skeleton->updateKinematics();
-                // only the interpolated in-between frames get floor-clamped — a
-                // pose you're deliberately editing at an exact keyframe (F to snap
-                // manually) is left alone, since you're in full control there
+                // only the interpolated in-between frames get floor-clamped — a pose
                 if (interpolating) skeleton->clampAboveGround();
             }
             skeleton->draw();
         }
+
+        // onion skins: re-pose env 0 at neighbouring times, draw translucent,
+        if (currentMode == ANIMATE && onionCount > 0 && !envs.empty() && tl.keys.size() >= 2) {
+            Skeleton* e0 = envs[0];
+            float saved = tl.cursor;
+            float lo = tl.keys.front().time, hi = tl.keys.back().time;
+            // snapshot the LIVE pose, not the cursor: while hand-editing (not playing or
+            // scrubbing) the pose on screen is the user's edit and applyPose would discard it
+            vec3 svPos = e0->pelvis->pos; quat svOri = e0->pelvis->orient;
+            vec3 svAng[13]; for (int j = 0; j < 13; j++) svAng[j] = e0->joints[j].targetAngle;
+            vec3 svOff = tl.pelvisOffset, svRot = tl.pelvisRot;
+            glDepthMask(GL_FALSE);
+            for (int i = onionCount; i >= 1; i--) {
+                for (int sgn = -1; sgn <= 1; sgn += 2) {
+                    if (sgn < 0 && onionDir == ONION_FUTURE) continue;
+                    if (sgn > 0 && onionDir == ONION_PAST)   continue;
+                    float t = saved + float(sgn * i * ONION_STEP) / 30.0f;
+                    if (t < lo || t > hi) continue;
+                    tl.cursor = t;
+                    tl.applyPose(e0);
+                    e0->updateKinematics();
+                    // Linear falloff to zero at the far end, not ONION_ALPHA/i:
+                    float fade = 1.0f - float(i - 1) / float(onionCount);
+                    float a = ONION_ALPHA * fade;
+                    vec3 tint = onionColor
+                        ? (sgn < 0 ? vec3(1.00f, 0.45f, 0.15f)    // past   - orange
+                                   : vec3(0.25f, 0.60f, 1.00f))   // future - blue
+                        : vec3(0.85f);                            // plain white body
+                    e0->draw(tint, a);
+                }
+            }
+            glDepthMask(GL_TRUE);
+            tl.cursor = saved;
+            tl.pelvisOffset = svOff; tl.pelvisRot = svRot;
+            for (int j = 0; j < 13; j++) e0->joints[j].targetAngle = svAng[j];
+            e0->pelvis->pos = svPos; e0->pelvis->orient = svOri;
+            e0->updateKinematics();
+        }
+
         if (currentMode == ANIMATE && !envs.empty()) gizmo.draw(envs[0]);
         tl.draw(); // last: 2D overlay swaps the projection matrices
 
