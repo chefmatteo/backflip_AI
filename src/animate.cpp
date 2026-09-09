@@ -736,6 +736,7 @@ struct TimelineUI {
     std::vector<Keyframe> keys; // always kept sorted by time
     float span = 5.0f;          // hard capacity: loaded animations longer than this are squashed to fit
     float cursor = 0.0f;        // playhead time
+    float playSpeed = 1.0f;     // 1 = realtime; [ / ] halves / doubles
     bool playing = false;
     bool scrubbing = false;     // left-drag on the track
     int dragKey = -1;           // index of the dot being dragged, -1 = none
@@ -875,7 +876,7 @@ struct TimelineUI {
     }
     void update(float dt) {
         if (!playing || scrubbing || keys.size() < 2) return;
-        cursor += dt;
+        cursor += dt * playSpeed;
         if (cursor > keys.back().time) cursor = keys.front().time; // loop first -> last
     }
     void applyPose(Skeleton* e) {
@@ -1350,9 +1351,21 @@ void KeyControl(GLFWwindow* w) {
     }
     nPrev = nNow;
 
-    // --- PLAYBACK (P = play, O = pause) ---
+    // --- PLAYBACK (P = play, O = pause, [ / ] = slower / faster) ---
     if (glfwGetKey(w, GLFW_KEY_P) == GLFW_PRESS) tl.play();
     if (glfwGetKey(w, GLFW_KEY_O) == GLFW_PRESS) tl.playing = false;
+    static bool brLPrev = false, brRPrev = false;
+    bool brL = glfwGetKey(w, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
+    bool brR = glfwGetKey(w, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
+    if (brL && !brLPrev) {
+        tl.playSpeed = glm::max(0.125f, tl.playSpeed * 0.5f);
+        std::cout << "play speed " << tl.playSpeed << "x\n";
+    }
+    if (brR && !brRPrev) {
+        tl.playSpeed = glm::min(4.0f, tl.playSpeed * 2.0f);
+        std::cout << "play speed " << tl.playSpeed << "x\n";
+    }
+    brLPrev = brL; brRPrev = brR;
 
     // --- TIMELINE ZOOM (- = zoom out, = = zoom in), anchored on the playhead ---
     float zoomRate = 1.03f; // per-frame multiplicative step while held, ~60fps
@@ -1557,6 +1570,7 @@ int main() {
         "  DELETE     delete the selected (yellow) keyframe\n"
         "  CTRL+C/V   copy selected keyframe / paste at the playhead\n"
         "  P / O      play / pause\n"
+        "  [ / ]      play slower / faster (0.125x .. 4x)\n"
         "  - / =      zoom timeline out / in (around the playhead)\n"
         "  ENTER      bake baked_motion.csv (first -> last keyframe)\n"
         "  L          log CoM-vs-feet balance offset for the current pose\n"
