@@ -18,7 +18,7 @@ torch.set_num_threads(1)
 # settings
 class Config:
     NUM_ENVS = 1
-    DPHASE = 1.0 / 56
+    DPHASE = 1.0 / 48
     STEP_DT = 1.0 / 30.0
     START_PHASE = 0.33      # phase the RSI preamble hands off to the policy at
     RSI_PLAYBACK = True     # replay the clip up to START_PHASE before the policy takes over
